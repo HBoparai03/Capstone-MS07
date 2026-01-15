@@ -13,7 +13,7 @@ import mediapipe as mp
 import time
 
 try:
-    import pyautogui  # For sending Ctrl+T to active window
+    import pyautogui  # For sending Ctrl+T to active window and mouse control
 except Exception:
     pyautogui = None
 
@@ -38,6 +38,13 @@ def get_args():
                         help='min_tracking_confidence',
                         type=int,
                         default=0.5)
+    parser.add_argument("--enable_air_mouse",
+                        help='Enable air mouse control when Pointer gesture is detected',
+                        action='store_true')
+    parser.add_argument("--mouse_sensitivity",
+                        help='Mouse movement sensitivity (higher = more sensitive)',
+                        type=float,
+                        default=2.0)
 
     args = parser.parse_args()
 
@@ -119,6 +126,16 @@ def main():
     last_hotkey_time = 0.0
     hotkey_cooldown_sec = 1.5
 
+    # Air mouse control variables
+    enable_air_mouse = True  # Always enabled
+    mouse_sensitivity = args.mouse_sensitivity
+    prev_mouse_pos = None
+    pointer_label_index = None
+    try:
+        pointer_label_index = keypoint_classifier_labels.index('Pointer')
+    except ValueError:
+        pointer_label_index = None
+
     while True:
         fps = cvFpsCalc.get()
 
@@ -162,10 +179,53 @@ def main():
 
                 # Hand sign classification
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-                if hand_sign_id == 2:  # Point gesture
+                is_pointer_gesture = (pointer_label_index is not None and 
+                                     hand_sign_id == pointer_label_index)
+                
+                if is_pointer_gesture:  # Pointer gesture
                     point_history.append(landmark_list[8])
+                    
+                    # Air mouse control
+                    if enable_air_mouse and pyautogui is not None and mode == 0:
+                        index_finger_tip = landmark_list[8]  # Index finger tip coordinates
+                        screen_width, screen_height = pyautogui.size()
+                        
+                        # Map camera coordinates to screen coordinates
+                        # Normalize to 0-1 range based on camera frame
+                        normalized_x = index_finger_tip[0] / cap_width
+                        normalized_y = index_finger_tip[1] / cap_height
+                        
+                        # Convert to screen coordinates
+                        # Sensitivity: 1.0 = full camera frame maps to full screen
+                        # Higher values (>1.0) = smaller camera region maps to full screen (more sensitive)
+                        # Lower values (<1.0) = larger camera region maps to full screen (less sensitive)
+                        effective_x = (normalized_x - 0.5) / mouse_sensitivity + 0.5
+                        effective_y = (normalized_y - 0.5) / mouse_sensitivity + 0.5
+                        
+                        screen_x = int(effective_x * screen_width)
+                        screen_y = int(effective_y * screen_height)
+                        
+                        # Smooth movement using previous position (simple smoothing)
+                        if prev_mouse_pos is not None:
+                            # Apply smoothing factor to reduce jitter
+                            smoothing = 0.7
+                            screen_x = int(screen_x * (1 - smoothing) + prev_mouse_pos[0] * smoothing)
+                            screen_y = int(screen_y * (1 - smoothing) + prev_mouse_pos[1] * smoothing)
+                        
+                        # Clamp to screen bounds
+                        screen_x = max(0, min(screen_width - 1, screen_x))
+                        screen_y = max(0, min(screen_height - 1, screen_y))
+                        
+                        # Move mouse cursor
+                        try:
+                            pyautogui.moveTo(screen_x, screen_y, duration=0.0)
+                            prev_mouse_pos = (screen_x, screen_y)
+                        except Exception:
+                            pass
                 else:
                     point_history.append([0, 0])
+                    # Reset previous mouse position when not in pointer mode
+                    prev_mouse_pos = None
 
                 # Hotkey actions: Gesture -> Keyboard shortcut
                 # - Only when not in logging modes (mode == 0)
