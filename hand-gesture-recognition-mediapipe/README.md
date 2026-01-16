@@ -27,3 +27,5 @@ pip install numpy==1.26.4
 
 ### Run Code
 python app.py
+# Max FPS Configuration
+python app.py --high_performance --num_threads 8 --draw_quality medium --mouse_update_rate 60 --min_mouse_movement 3
