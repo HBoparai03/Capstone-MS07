@@ -13,6 +13,7 @@ Run: py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 # Install Dependencies
+```bash
 pip install protobuf==3.20.3
 
 pip install tensorflow==2.15.0
@@ -24,8 +25,24 @@ pip install opencv-python==4.8.1.78
 pip install pyautogui==0.9.54
 
 pip install numpy==1.26.4
+```
 
 ### Run Code
+```bash
 python app.py
+```
+
 # Max FPS Configuration
-python app.py --high_performance --num_threads 8 --draw_quality medium --mouse_update_rate 60 --min_mouse_movement 3
+```bash
+python app.py --high_performance --num_threads 8 --draw_quality medium --mouse_update_rate 120 --min_mouse_movement 2
+```
+
+### For Balanced Performance/Quality
+```bash
+python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2
+```
+
+### For Low-End Systems
+```bash
+python app.py --draw_quality low --mouse_update_rate 30 --min_mouse_movement 5
+```
