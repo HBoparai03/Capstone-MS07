@@ -4,6 +4,8 @@ numpy
 tensorflow
 pyautogui
 opencv-python
+pycaw (for volume control)
+comtypes (required by pycaw)
 
 # Python Version
 ### Create a virtual environment with the correct Python version
@@ -25,6 +27,10 @@ pip install opencv-python==4.8.1.78
 pip install pyautogui==0.9.54
 
 pip install numpy==1.26.4
+
+pip install pycaw
+
+pip install comtypes
 ```
 
 ### Run Code
