@@ -19,6 +19,14 @@ try:
 except Exception:
     pyautogui = None
 
+try:
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    VOLUME_CONTROL_AVAILABLE = True
+except Exception:
+    VOLUME_CONTROL_AVAILABLE = False
+
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
@@ -136,6 +144,29 @@ def main():
         close_label_index = keypoint_classifier_labels.index('Close')
     except ValueError:
         close_label_index = None
+    
+    try:
+        thumbs_up_label_index = keypoint_classifier_labels.index('Thumbs Up')
+    except ValueError:
+        thumbs_up_label_index = None
+    
+    try:
+        thumbs_down_label_index = keypoint_classifier_labels.index('Thumbs Down')
+    except ValueError:
+        thumbs_down_label_index = None
+    
+    # Initialize volume control if available
+    volume_interface = None
+    if VOLUME_CONTROL_AVAILABLE:
+        try:
+
+            devices = AudioUtilities.GetSpeakers()
+            volume_interface = devices.EndpointVolume.QueryInterface(IAudioEndpointVolume)
+
+            print("Volume interface initialized OK")
+        except Exception as e:
+            print("Volume init error:", repr(e))
+            volume_interface = None
 
     # FPS Measurement ########################################################
     cvFpsCalc = CvFpsCalc(buffer_len=10)
@@ -341,6 +372,36 @@ def main():
                               hand_sign_id == close_label_index):
                             try:
                                 pyautogui.hotkey('ctrl', 'w')
+                                last_hotkey_time = now
+                            except Exception:
+                                pass
+                
+                # Volume control: Gesture -> Volume adjustment
+                # - Only when not in logging modes (mode == 0)
+                # - Debounced to avoid repeated triggers
+                # - Requires volume control to be available
+                if mode == 0 and volume_interface is not None:
+                    now = time.time()
+                    if now - last_hotkey_time > hotkey_cooldown_sec:
+                        # Thumbs Up -> Increase volume
+                        if (thumbs_up_label_index is not None and
+                                hand_sign_id == thumbs_up_label_index):
+                            try:
+                                current_volume = volume_interface.GetMasterVolumeLevelScalar()
+                                # Increase volume by 5% (0.05)
+                                new_volume = min(1.0, current_volume + 0.05)
+                                volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
+                                last_hotkey_time = now
+                            except Exception:
+                                pass
+                        # Thumbs Down -> Decrease volume
+                        elif (thumbs_down_label_index is not None and
+                              hand_sign_id == thumbs_down_label_index):
+                            try:
+                                current_volume = volume_interface.GetMasterVolumeLevelScalar()
+                                # Decrease volume by 5% (0.05)
+                                new_volume = max(0.0, current_volume - 0.05)
+                                volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
                                 last_hotkey_time = now
                             except Exception:
                                 pass
