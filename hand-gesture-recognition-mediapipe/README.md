@@ -9,8 +9,9 @@ comtypes (required by pycaw)
 
 # Python Version
 ### Create a virtual environment with the correct Python version
-Run: py -3.10 -m venv .venv
-
+```bash
+py -3.10 -m venv .venv
+```
 ### Activate virtual environment
 .\.venv\Scripts\Activate.ps1
 
