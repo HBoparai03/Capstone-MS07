@@ -154,7 +154,17 @@ def main():
         thumbs_down_label_index = keypoint_classifier_labels.index('Thumbs Down')
     except ValueError:
         thumbs_down_label_index = None
-    
+
+    try:
+        two_fingers_up_label_index = keypoint_classifier_labels.index('Two Fingers Up')
+    except ValueError:
+        two_fingersup_label_index = None
+
+    try:
+        three_fingers_up_label_index = keypoint_classifier_labels.index('Three Fingers Up')
+    except ValueError:
+        three_fingersup_label_index = None
+
     # Initialize volume control if available
     volume_interface = None
     if VOLUME_CONTROL_AVAILABLE:
