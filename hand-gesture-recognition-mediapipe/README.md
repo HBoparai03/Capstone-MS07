@@ -7,6 +7,9 @@ opencv-python
 pycaw (for volume control)
 comtypes (required by pycaw)
 
+# CD into hand-gesture-recognition-mediapipe folder
+cd .\hand-gesture-recognition-mediapipe\
+
 # Python Version
 ### Create a virtual environment with the correct Python version
 ```bash
@@ -32,6 +35,13 @@ pip install numpy==1.26.4
 pip install pycaw
 
 pip install comtypes
+
+pip install scikit-learn
+
+pip install jupyter ipykernel
+
+pip install pandas seaborn matplotlib
+
 ```
 
 ### Run Code
