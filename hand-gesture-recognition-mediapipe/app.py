@@ -158,12 +158,12 @@ def main():
     try:
         two_fingers_up_label_index = keypoint_classifier_labels.index('Two Fingers Up')
     except ValueError:
-        two_fingersup_label_index = None
+        two_fingers_up_label_index = None
 
     try:
         three_fingers_up_label_index = keypoint_classifier_labels.index('Three Fingers Up')
     except ValueError:
-        three_fingersup_label_index = None
+        three_fingers_up_label_index = None
 
     # Initialize volume control if available
     volume_interface = None
@@ -412,6 +412,24 @@ def main():
                                 # Decrease volume by 5% (0.05)
                                 new_volume = max(0.0, current_volume - 0.05)
                                 volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
+                                last_hotkey_time = now
+                            except Exception:
+                                pass
+                
+                # Two Fingers Up -> Play/Pause toggle
+                # Three Fingers Up -> Go back (Alt+Left)
+                if mode == 0 and pyautogui is not None:
+                    now = time.time()
+                    if now - last_hotkey_time > hotkey_cooldown_sec:
+                        if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
+                            try:
+                                pyautogui.press('playpause')
+                                last_hotkey_time = now
+                            except Exception:
+                                pass
+                        elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
+                            try:
+                                pyautogui.hotkey('alt', 'left')
                                 last_hotkey_time = now
                             except Exception:
                                 pass
