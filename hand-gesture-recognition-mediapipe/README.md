@@ -42,6 +42,12 @@ pip install jupyter ipykernel
 
 pip install pandas seaborn matplotlib
 
+pip install PyQt5
+
+pip install pystray
+
+pip install pillow
+
 ```
 
 ### Run Code
@@ -56,10 +62,25 @@ python app.py --high_performance --num_threads 8 --draw_quality medium --mouse_u
 
 ### For Balanced Performance/Quality
 ```bash
-python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2
+python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --ui new
 ```
 
 ### For Low-End Systems
 ```bash
 python app.py --draw_quality low --mouse_update_rate 30 --min_mouse_movement 5
+```
+
+### Run the classic OpenCV window UI (default)
+```bash
+python app.py
+```
+
+### Or explicitly:
+```bash
+python app.py --ui old
+```
+
+### Run the new PyQt5 overlay UI
+```bash
+python app.py --ui new
 ```
