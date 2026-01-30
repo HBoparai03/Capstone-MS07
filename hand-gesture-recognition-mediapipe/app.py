@@ -52,9 +52,13 @@ def get_args():
                         help='Enable air mouse control when Pointer gesture is detected',
                         action='store_true')
     parser.add_argument("--mouse_sensitivity",
-                        help='Mouse movement sensitivity (higher = more sensitive)',
+                        help='Mouse movement sensitivity (1.0 = full screen travel; >1 = faster, <1 = slower but may not reach edges)',
                         type=float,
-                        default=2.0)
+                        default=1.0)
+    parser.add_argument("--mouse_smoothing",
+                        help='How much to smooth cursor movement (0=no smoothing, 1=very slow; default: 0.85)',
+                        type=float,
+                        default=0.85)
     parser.add_argument("--high_performance",
                         help='Enable high-performance mode (uses more CPU/GPU resources)',
                         action='store_true')
@@ -198,6 +202,7 @@ def main():
     # Air mouse control variables
     enable_air_mouse = True  # Always enabled
     mouse_sensitivity = args.mouse_sensitivity
+    mouse_smoothing = max(0.0, min(0.99, args.mouse_smoothing))  # Clamp to avoid div/edge issues
     prev_mouse_pos = None
     pointer_label_index = None
     try:
@@ -298,27 +303,26 @@ def main():
                     if enable_air_mouse and pyautogui is not None and mode == 0:
                         index_finger_tip = landmark_list[8]  # Index finger tip coordinates
                         
-                        # Map camera coordinates to screen coordinates
+                        # Map camera coordinates to screen coordinates (full camera range -> full screen)
                         # Normalize to 0-1 range based on camera frame
                         normalized_x = index_finger_tip[0] / cap_width
                         normalized_y = index_finger_tip[1] / cap_height
                         
-                        # Convert to screen coordinates
-                        # Sensitivity: 1.0 = full camera frame maps to full screen
-                        # Higher values (>1.0) = smaller camera region maps to full screen (more sensitive)
-                        # Lower values (<1.0) = larger camera region maps to full screen (less sensitive)
-                        effective_x = (normalized_x - 0.5) / mouse_sensitivity + 0.5
-                        effective_y = (normalized_y - 0.5) / mouse_sensitivity + 0.5
+                        # Convert to screen coordinates with sensitivity as gain (not range shrink)
+                        # Sensitivity: 1.0 = 1:1 mapping; >1.0 = more sensitive (small hand move = big cursor move)
+                        # Full camera range (0-1) always maps to full screen; clamp keeps cursor on screen
+                        effective_x = (normalized_x - 0.5) * mouse_sensitivity + 0.5
+                        effective_y = (normalized_y - 0.5) * mouse_sensitivity + 0.5
+                        effective_x = max(0.0, min(1.0, effective_x))
+                        effective_y = max(0.0, min(1.0, effective_y))
                         
                         screen_x = int(effective_x * screen_width)
                         screen_y = int(effective_y * screen_height)
                         
-                        # Smooth movement using previous position (simple smoothing)
+                        # Smooth movement using previous position (slower = higher smoothing)
                         if prev_mouse_pos is not None:
-                            # Apply smoothing factor to reduce jitter
-                            smoothing = 0.7
-                            screen_x = int(screen_x * (1 - smoothing) + prev_mouse_pos[0] * smoothing)
-                            screen_y = int(screen_y * (1 - smoothing) + prev_mouse_pos[1] * smoothing)
+                            screen_x = int(screen_x * (1 - mouse_smoothing) + prev_mouse_pos[0] * mouse_smoothing)
+                            screen_y = int(screen_y * (1 - mouse_smoothing) + prev_mouse_pos[1] * mouse_smoothing)
                         
                         # Clamp to screen bounds
                         screen_x = max(0, min(screen_width - 1, screen_x))
