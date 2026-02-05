@@ -6,6 +6,7 @@ import argparse
 import itertools
 from collections import Counter
 from collections import deque
+import sys
 
 import cv2 as cv
 import numpy as np
@@ -35,6 +36,11 @@ from model import PointHistoryClassifier
 def get_args():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--ui", 
+                        help='UI version to use: "old" (OpenCV window) or "new" (PyQt5 overlay)',
+                        type=str,
+                        default='old',
+                        choices=['old', 'new'])
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--width", help='cap width', type=int, default=960)
     parser.add_argument("--height", help='cap height', type=int, default=540)
@@ -85,10 +91,280 @@ def get_args():
     return args
 
 
-def main():
-    # Argument parsing #################################################################
-    args = get_args()
+def main_new_ui(args):
+    """Run the new PyQt5 overlay UI with gesture recognition."""
+    from PyQt5.QtWidgets import QApplication
+    from PyQt5.QtCore import QTimer
+    from Overlay import OverlayWindow
+    from Tray import TrayIcon
+    
+    # Initialize MediaPipe and classifiers
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(
+        static_image_mode=args.use_static_image_mode,
+        max_num_hands=2,
+        min_detection_confidence=args.min_detection_confidence,
+        min_tracking_confidence=args.min_tracking_confidence,
+    )
+    
+    # Determine number of threads for TensorFlow Lite
+    if args.high_performance:
+        num_threads = args.num_threads if args.num_threads is not None else 4
+    else:
+        num_threads = args.num_threads if args.num_threads is not None else 1
+    
+    keypoint_classifier = KeyPointClassifier(num_threads=num_threads)
+    point_history_classifier = PointHistoryClassifier(num_threads=num_threads)
+    
+    # Read labels
+    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
+              encoding='utf-8-sig') as f:
+        keypoint_classifier_labels = csv.reader(f)
+        keypoint_classifier_labels = [row[0] for row in keypoint_classifier_labels]
+    
+    with open('model/point_history_classifier/point_history_classifier_label.csv',
+              encoding='utf-8-sig') as f:
+        point_history_classifier_labels = csv.reader(f)
+        point_history_classifier_labels = [row[0] for row in point_history_classifier_labels]
+    
+    # Resolve label indices for hand signs
+    def get_label_index(labels, name):
+        try:
+            return labels.index(name)
+        except ValueError:
+            return None
+    
+    open_label_index = get_label_index(keypoint_classifier_labels, 'Open')
+    close_label_index = get_label_index(keypoint_classifier_labels, 'Close')
+    thumbs_up_label_index = get_label_index(keypoint_classifier_labels, 'Thumbs Up')
+    thumbs_down_label_index = get_label_index(keypoint_classifier_labels, 'Thumbs Down')
+    two_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Two Fingers Up')
+    three_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Three Fingers Up')
+    pointer_label_index = get_label_index(keypoint_classifier_labels, 'Pointer')
+    
+    # Initialize volume control if available
+    volume_interface = None
+    if VOLUME_CONTROL_AVAILABLE:
+        try:
+            devices = AudioUtilities.GetSpeakers()
+            volume_interface = devices.EndpointVolume.QueryInterface(IAudioEndpointVolume)
+            print("Volume interface initialized OK")
+        except Exception as e:
+            print("Volume init error:", repr(e))
+            volume_interface = None
+    
+    # Coordinate history
+    history_length = 16
+    point_history = deque(maxlen=history_length)
+    finger_gesture_history = deque(maxlen=history_length)
+    
+    # Air mouse control variables
+    mouse_sensitivity = args.mouse_sensitivity
+    mouse_smoothing = max(0.0, min(0.99, args.mouse_smoothing))
+    prev_mouse_pos = [None]  # Use list to allow mutation in nested function
+    
+    # Cache screen size
+    screen_width, screen_height = None, None
+    if pyautogui is not None:
+        screen_width, screen_height = pyautogui.size()
+    
+    # Mouse movement throttling
+    mouse_update_interval = 1.0 / args.mouse_update_rate
+    min_mouse_movement = args.min_mouse_movement
+    last_mouse_update_time = [0.0]
+    
+    # Debounce for hotkey actions
+    last_hotkey_time = [0.0]
+    hotkey_cooldown_sec = 1.5
+    
+    # Create the Qt application
+    app = QApplication(sys.argv)
+    
+    # Create the overlay window
+    overlay = OverlayWindow()
+    
+    # Store gesture state for the overlay
+    current_gesture = ["Gesture: (awaiting detection...)"]
+    
+    def process_frame():
+        """Process a frame and perform gesture recognition."""
+        frame = overlay.detector.get_frame()
+        if frame is None:
+            return
+        
+        # Convert to RGB for MediaPipe
+        image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        image_rgb.flags.writeable = False
+        results = hands.process(image_rgb)
+        image_rgb.flags.writeable = True
+        
+        if results.multi_hand_landmarks is not None:
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
+                                                  results.multi_handedness):
+                # Landmark calculation
+                landmark_list = calc_landmark_list(frame, hand_landmarks)
+                
+                # Conversion to relative coordinates / normalized coordinates
+                pre_processed_landmark_list = pre_process_landmark(landmark_list)
+                pre_processed_point_history_list = pre_process_point_history(
+                    frame, point_history)
+                
+                # Hand sign classification
+                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
+                hand_sign_label = keypoint_classifier_labels[hand_sign_id]
+                
+                is_pointer_gesture = (pointer_label_index is not None and 
+                                     hand_sign_id == pointer_label_index)
+                
+                if is_pointer_gesture:
+                    point_history.append(landmark_list[8])
+                    
+                    # Air mouse control
+                    if pyautogui is not None:
+                        cap_width = frame.shape[1]
+                        cap_height = frame.shape[0]
+                        index_finger_tip = landmark_list[8]
+                        
+                        normalized_x = index_finger_tip[0] / cap_width
+                        normalized_y = index_finger_tip[1] / cap_height
+                        
+                        effective_x = (normalized_x - 0.5) * mouse_sensitivity + 0.5
+                        effective_y = (normalized_y - 0.5) * mouse_sensitivity + 0.5
+                        effective_x = max(0.0, min(1.0, effective_x))
+                        effective_y = max(0.0, min(1.0, effective_y))
+                        
+                        screen_x = int(effective_x * screen_width)
+                        screen_y = int(effective_y * screen_height)
+                        
+                        if prev_mouse_pos[0] is not None:
+                            screen_x = int(screen_x * (1 - mouse_smoothing) + prev_mouse_pos[0][0] * mouse_smoothing)
+                            screen_y = int(screen_y * (1 - mouse_smoothing) + prev_mouse_pos[0][1] * mouse_smoothing)
+                        
+                        screen_x = max(0, min(screen_width - 1, screen_x))
+                        screen_y = max(0, min(screen_height - 1, screen_y))
+                        
+                        now = time.time()
+                        should_update = False
+                        
+                        if prev_mouse_pos[0] is None:
+                            should_update = True
+                        else:
+                            time_since_update = now - last_mouse_update_time[0]
+                            if time_since_update >= mouse_update_interval:
+                                dx = abs(screen_x - prev_mouse_pos[0][0])
+                                dy = abs(screen_y - prev_mouse_pos[0][1])
+                                if dx >= min_mouse_movement or dy >= min_mouse_movement:
+                                    should_update = True
+                        
+                        if should_update:
+                            try:
+                                pyautogui.moveTo(screen_x, screen_y, duration=0.0)
+                                prev_mouse_pos[0] = (screen_x, screen_y)
+                                last_mouse_update_time[0] = now
+                            except Exception:
+                                pass
+                else:
+                    point_history.append([0, 0])
+                    prev_mouse_pos[0] = None
+                
+                # Hotkey actions
+                if pyautogui is not None:
+                    now = time.time()
+                    if now - last_hotkey_time[0] > hotkey_cooldown_sec:
+                        if open_label_index is not None and hand_sign_id == open_label_index:
+                            try:
+                                pyautogui.hotkey('ctrl', 't')
+                                last_hotkey_time[0] = now
+                            except Exception:
+                                pass
+                        elif close_label_index is not None and hand_sign_id == close_label_index:
+                            try:
+                                pyautogui.hotkey('ctrl', 'w')
+                                last_hotkey_time[0] = now
+                            except Exception:
+                                pass
+                
+                # Volume control
+                if volume_interface is not None:
+                    now = time.time()
+                    if now - last_hotkey_time[0] > hotkey_cooldown_sec:
+                        if thumbs_up_label_index is not None and hand_sign_id == thumbs_up_label_index:
+                            try:
+                                current_volume = volume_interface.GetMasterVolumeLevelScalar()
+                                new_volume = min(1.0, current_volume + 0.05)
+                                volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
+                                last_hotkey_time[0] = now
+                            except Exception:
+                                pass
+                        elif thumbs_down_label_index is not None and hand_sign_id == thumbs_down_label_index:
+                            try:
+                                current_volume = volume_interface.GetMasterVolumeLevelScalar()
+                                new_volume = max(0.0, current_volume - 0.05)
+                                volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
+                                last_hotkey_time[0] = now
+                            except Exception:
+                                pass
+                
+                # Play/Pause and Go back
+                if pyautogui is not None:
+                    now = time.time()
+                    if now - last_hotkey_time[0] > hotkey_cooldown_sec:
+                        if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
+                            try:
+                                pyautogui.press('playpause')
+                                last_hotkey_time[0] = now
+                            except Exception:
+                                pass
+                        elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
+                            try:
+                                pyautogui.hotkey('alt', 'left')
+                                last_hotkey_time[0] = now
+                            except Exception:
+                                pass
+                
+                # Finger gesture classification
+                finger_gesture_id = 0
+                point_history_len = len(pre_processed_point_history_list)
+                if point_history_len == (history_length * 2):
+                    finger_gesture_id = point_history_classifier(pre_processed_point_history_list)
+                
+                finger_gesture_history.append(finger_gesture_id)
+                most_common_fg_id = Counter(finger_gesture_history).most_common()
+                
+                # Update gesture label
+                handedness_label = handedness.classification[0].label
+                finger_gesture_label = point_history_classifier_labels[most_common_fg_id[0][0]]
+                current_gesture[0] = f"{handedness_label}: {hand_sign_label}"
+                if finger_gesture_label:
+                    current_gesture[0] += f" | {finger_gesture_label}"
+        else:
+            point_history.append([0, 0])
+            current_gesture[0] = "Gesture: (no hand detected)"
+    
+    # Override the detector's get_gesture_label to return actual gesture
+    original_get_gesture_label = overlay.detector.get_gesture_label
+    def get_gesture_label_override():
+        return current_gesture[0]
+    overlay.detector.get_gesture_label = get_gesture_label_override
+    
+    # Create a timer to run gesture processing alongside the frame updates
+    gesture_timer = QTimer()
+    gesture_timer.timeout.connect(process_frame)
+    gesture_timer.start(30)  # ~33 FPS
+    
+    # Show the overlay
+    overlay.show()
+    
+    # Create and run the tray icon
+    tray = TrayIcon(overlay)
+    tray.run()
+    
+    # Run the Qt event loop
+    sys.exit(app.exec_())
 
+
+def main_old_ui(args):
+    """Run the original OpenCV window UI with gesture recognition."""
     cap_device = args.device
     cap_width = args.width
     cap_height = args.height
@@ -766,6 +1042,18 @@ def draw_info(image, fps, mode, number):
                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
                        cv.LINE_AA)
     return image
+
+
+def main():
+    """Main entry point - dispatches to old or new UI based on --ui argument."""
+    args = get_args()
+    
+    if args.ui == 'new':
+        print("Starting new PyQt5 overlay UI...")
+        main_new_ui(args)
+    else:
+        print("Starting classic OpenCV window UI...")
+        main_old_ui(args)
 
 
 if __name__ == '__main__':
