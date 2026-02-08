@@ -12,6 +12,7 @@ class PointHistoryClassifier(object):
         invalid_value=0,
         num_threads=1,
     ):
+        # Performance: Use multi-threading for faster inference
         self.interpreter = tf.lite.Interpreter(model_path=model_path,
                                                num_threads=num_threads)
 
