@@ -21,6 +21,10 @@ class OverlayWindow(QWidget):
         self.detector = GestureDetector()
         self.overlay_visible = True
         self.table_visible = False
+        # When True, frame/label are set by app (single camera read per tick); no get_frame in update_frame
+        self._app_driven = False
+        self._last_frame = None
+        self._last_gesture_label = None
 
         # --- Window Setup ---
         self.setWindowTitle("Gesture Overlay")
@@ -153,6 +157,22 @@ class OverlayWindow(QWidget):
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
 
     # ----------------------------
+    # App-driven mode (single camera read in app.py; overlay just displays)
+    # ----------------------------
+    def set_app_driven(self, on):
+        self._app_driven = bool(on)
+        if self._app_driven:
+            self.timer.stop()
+
+    def set_camera_frame(self, frame):
+        """Set the frame to display (used when app_driven)."""
+        self._last_frame = frame
+
+    def set_gesture_label(self, text):
+        """Set the gesture label (used when app_driven)."""
+        self._last_gesture_label = text
+
+    # ----------------------------
     # Toggle overlay/table
     # ----------------------------
     def toggle_overlay(self):
@@ -173,11 +193,18 @@ class OverlayWindow(QWidget):
     # Update camera frame
     # ----------------------------
     def update_frame(self):
-        frame = self.detector.get_frame()
+        if self._app_driven:
+            # Frame and label are set by app; just refresh display from last set values
+            frame = self._last_frame
+            text = self._last_gesture_label if self._last_gesture_label is not None else "Gesture: (awaiting...)"
+        else:
+            frame = self.detector.get_frame()
+            text = self.detector.get_gesture_label()
         if frame is not None:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
-            image = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            bytes_per_line = ch * w
+            image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
             self.camera_label.setPixmap(
                 QPixmap.fromImage(image).scaled(
                     self.camera_label.size(),
@@ -185,7 +212,8 @@ class OverlayWindow(QWidget):
                     Qt.SmoothTransformation
                 )
             )
-        self.gesture_label.setText(self.detector.get_gesture_label())
+        if text is not None:
+            self.gesture_label.setText(text)
 
     # ----------------------------
     # Paint translucent overlay
