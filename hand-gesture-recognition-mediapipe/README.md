@@ -62,7 +62,7 @@ python app.py --high_performance --num_threads 8 --draw_quality medium --mouse_u
 
 ### For Balanced Performance/Quality
 ```bash
-python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --ui new
+python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --ui new --gesturehand right --mousehand left
 ```
 
 ### For Low-End Systems
@@ -83,4 +83,14 @@ python app.py --ui old
 ### Run the new PyQt5 overlay UI
 ```bash
 python app.py --ui new
+```
+
+# Hand assignment (gesture hand vs mouse hand)
+```bash
+python app.py --gesturehand right --mousehand left
+```
+
+Example: left hand for gestures, right hand for cursor:
+```bash
+python app.py --gesturehand left --mousehand right
 ```
