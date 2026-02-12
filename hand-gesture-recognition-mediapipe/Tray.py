@@ -9,6 +9,8 @@ class TrayIcon:
         self.icon = pystray.Icon("Gesture Overlay", self._create_icon(), "Gesture Overlay", menu=pystray.Menu(
             pystray.MenuItem("Show/Hide Overlay", self.toggle_visibility),
             pystray.MenuItem("Instructions", self.show_instructions ),
+            pystray.MenuItem("Toggle Mouse", self.toggle_mouse),
+            pystray.MenuItem("Toggle Left/Right Mouse Control", self.toggle_left_right),
             pystray.MenuItem("Exit", self.exit_app)
         ))
 
@@ -36,6 +38,12 @@ class TrayIcon:
     def exit_app(self, icon, item):
         self.window.close()
         icon.stop()
+
+    def toggle_left_right(self, icon, item):
+        return
+
+    def toggle_mouse(self, icon, item):
+        return
 
     def run(self):
         threading.Thread(target=self.icon.run, daemon=True).start()
