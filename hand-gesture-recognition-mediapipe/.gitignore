@@ -21,6 +21,10 @@ __pycache__/
 *.swp
 *.swo
 
+# PyInstaller
+build/
+dist/
+
 # OS
 .DS_Store
 Thumbs.db
