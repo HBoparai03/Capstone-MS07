@@ -62,7 +62,7 @@ python app.py --ui old
 
 ### For balanced performance/quality
 ```bash
-python app.py --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2
+python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --ui new
 ```
 
 ### For low-end systems
