@@ -153,9 +153,6 @@ def main_new_ui(args):
     pointer_label_index = get_label_index(keypoint_classifier_labels, 'Pointer')
     pinch_label_index = get_label_index(keypoint_classifier_labels, 'Pinch')
     
-    gesture_hand_label = args.gesturehand.capitalize()
-    mouse_hand_label = args.mousehand.capitalize()
-    
     # Initialize volume control if available
     volume_interface = None
     if VOLUME_CONTROL_AVAILABLE:
@@ -197,6 +194,9 @@ def main_new_ui(args):
     # Create the overlay window
     overlay = OverlayWindow()
     
+    # Create the tray icon (owns gesture_hand / mouse_enabled state)
+    tray = TrayIcon(overlay, gesture_hand=args.gesturehand.capitalize(), mouse_enabled=True)
+    
     # Store gesture state for the overlay
     current_gesture = ["Gesture: (awaiting detection...)"]
     
@@ -227,8 +227,8 @@ def main_new_ui(args):
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
                 hand_sign_label = keypoint_classifier_labels[hand_sign_id]
                 hand_label = handedness.classification[0].label
-                is_gesture_hand = (hand_label == gesture_hand_label)
-                is_mouse_hand = (hand_label == mouse_hand_label)
+                is_gesture_hand = (hand_label == tray.gesture_hand)
+                is_mouse_hand = (hand_label == tray.mouse_hand) and tray.mouse_enabled
                 is_pointer_gesture = (pointer_label_index is not None and 
                                      hand_sign_id == pointer_label_index)
                 is_pinch_gesture = (pinch_label_index is not None and 
@@ -385,8 +385,7 @@ def main_new_ui(args):
     # Show the overlay
     overlay.show()
     
-    # Create and run the tray icon
-    tray = TrayIcon(overlay)
+    # Start the tray icon
     tray.run()
     
     # Run the Qt event loop
