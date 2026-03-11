@@ -31,6 +31,7 @@ class TrayIcon:
         self.window = window
         self.gesture_hand = gesture_hand
         self.mouse_enabled = mouse_enabled
+        self._bridge = None
 
         self.icon = pystray.Icon("Gesture Overlay", self._create_icon(), "Gesture Overlay", menu=pystray.Menu(
             pystray.MenuItem("Show/Hide Overlay", self.toggle_visibility),
@@ -71,8 +72,7 @@ class TrayIcon:
             if self.window.isVisible():
                 self.window.toggle_gesture_table()
         elif action == "exit":
-            self.window.close()
-            self.icon.stop()
+            self._force_exit()
 
     def toggle_visibility(self, icon, item):
         if self._bridge is not None:
@@ -92,8 +92,26 @@ class TrayIcon:
         if self._bridge is not None:
             self._bridge.actionRequested.emit("exit")
         else:
+            self._force_exit()
+
+    def _force_exit(self):
+        """Clean up and forcefully terminate the entire process."""
+        try:
+            self.icon.stop()
+        except Exception:
+            pass
+        try:
             self.window.close()
-            icon.stop()
+        except Exception:
+            pass
+        try:
+            from PyQt5.QtWidgets import QApplication
+            q = QApplication.instance()
+            if q is not None:
+                q.quit()
+        except Exception:
+            pass
+        os._exit(0)
 
     def toggle_left_right(self, icon, item):
         if self.gesture_hand == "Right":
