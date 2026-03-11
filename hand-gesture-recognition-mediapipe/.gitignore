@@ -16,6 +16,7 @@ __pycache__/
 
 # IDE
 .vscode/
+.vs/
 .idea/
 *.swp
 *.swo
@@ -23,3 +24,4 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
