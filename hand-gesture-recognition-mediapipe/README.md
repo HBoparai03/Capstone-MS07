@@ -99,3 +99,14 @@ The executable is created at `dist\HandGestureRecognition.exe`. Run it as-is; no
 ### Requirements for building
 - Use the same Python version and dependencies as for running the app (e.g. Python 3.10, TensorFlow 2.15, MediaPipe, PyQt5, etc.).
 - First run and test with `python app.py` in that environment, then run the spec above.
+### Run the new PyQt5 overlay UI
+```bash
+python app.py --ui new
+```
+
+# Hand Assignment & Mouse Toggle (System Tray)
+Gesture hand and mouse control are managed at runtime via the system tray icon:
+- **Toggle Left/Right** — swaps the gesture hand; the mouse hand is always the opposite.
+- **Toggle Mouse** — enables or disables cursor control on the mouse hand.
+
+The `--gesturehand` flag can still be passed to set the *initial* gesture hand (defaults to `right`). The `--mousehand` flag is no longer needed since it is derived automatically.
