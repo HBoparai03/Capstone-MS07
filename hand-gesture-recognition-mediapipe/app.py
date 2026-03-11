@@ -4,9 +4,25 @@ import csv
 import copy
 import argparse
 import itertools
+import os
+import sys
 from collections import Counter
 from collections import deque
-import sys
+
+if hasattr(sys, "_MEIPASS"):
+    os.environ["MEDIAPIPE_RESOURCE_PATH"] = sys._MEIPASS
+
+
+def resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
+def get_base_path():
+    """Return base path for resources (works when run as script or as PyInstaller exe)."""
+    if getattr(sys, 'frozen', False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
 
 import cv2 as cv
 import numpy as np
@@ -36,10 +52,10 @@ from model import PointHistoryClassifier
 def get_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--ui", 
+    parser.add_argument("--ui",
                         help='UI version to use: "old" (OpenCV window) or "new" (PyQt5 overlay)',
                         type=str,
-                        default='old',
+                        default='new',
                         choices=['old', 'new'])
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--width", help='cap width', type=int, default=960)
@@ -67,23 +83,28 @@ def get_args():
                         default=0.85)
     parser.add_argument("--high_performance",
                         help='Enable high-performance mode (uses more CPU/GPU resources)',
-                        action='store_true')
+                        action='store_true',
+                        default=True)
+    parser.add_argument("--no_high_performance",
+                        help='Disable high-performance mode',
+                        action='store_false',
+                        dest='high_performance')
     parser.add_argument("--num_threads",
-                        help='Number of threads for TensorFlow Lite (0 = auto, default: 4 in high-performance mode)',
+                        help='Number of threads for TensorFlow Lite (default: 8 in high-performance, 1 otherwise)',
                         type=int,
                         default=None)
     parser.add_argument("--mouse_update_rate",
-                        help='Mouse update rate in Hz (higher = smoother but more CPU, default: 60)',
+                        help='Mouse update rate in Hz (higher = smoother but more CPU, default: 120)',
                         type=int,
-                        default=60)
+                        default=120)
     parser.add_argument("--min_mouse_movement",
                         help='Minimum pixel movement before updating mouse (reduces overhead, default: 2)',
                         type=int,
                         default=2)
     parser.add_argument("--draw_quality",
-                        help='Drawing quality: "high", "medium", "low" (default: high)',
+                        help='Drawing quality: "high", "medium", "low" (default: medium)',
                         type=str,
-                        default='high',
+                        default='medium',
                         choices=['high', 'medium', 'low'])
     parser.add_argument("--gesturehand",
                         help='Hand that triggers gesture actions (Open, Close, OK, Thumbs Up/Down, Pinch=left click, etc.).',
@@ -119,24 +140,27 @@ def main_new_ui(args):
     
     # Determine number of threads for TensorFlow Lite
     if args.high_performance:
-        num_threads = args.num_threads if args.num_threads is not None else 4
+        num_threads = args.num_threads if args.num_threads is not None else 8
     else:
         num_threads = args.num_threads if args.num_threads is not None else 1
-    
-    keypoint_classifier = KeyPointClassifier(num_threads=num_threads)
-    point_history_classifier = PointHistoryClassifier(num_threads=num_threads)
-    
+
+    base_path = get_base_path()
+    keypoint_model = os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier.tflite')
+    point_history_model = os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier.tflite')
+    keypoint_classifier = KeyPointClassifier(model_path=keypoint_model, num_threads=num_threads)
+    point_history_classifier = PointHistoryClassifier(model_path=point_history_model, num_threads=num_threads)
+
     # Read labels
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
+    with open(os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier_label.csv'),
               encoding='utf-8-sig') as f:
         keypoint_classifier_labels = csv.reader(f)
         keypoint_classifier_labels = [row[0] for row in keypoint_classifier_labels]
-    
-    with open('model/point_history_classifier/point_history_classifier_label.csv',
+
+    with open(os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier_label.csv'),
               encoding='utf-8-sig') as f:
         point_history_classifier_labels = csv.reader(f)
         point_history_classifier_labels = [row[0] for row in point_history_classifier_labels]
-    
+
     # Resolve label indices for hand signs
     def get_label_index(labels, name):
         try:
@@ -199,13 +223,16 @@ def main_new_ui(args):
     
     # Store gesture state for the overlay
     current_gesture = ["Gesture: (awaiting detection...)"]
-    
+
+    # Single camera read per tick: app timer drives frame + gesture; overlay only displays.
+    overlay.set_app_driven(True)
+
     def process_frame():
-        """Process a frame and perform gesture recognition."""
+        """Process a frame and perform gesture recognition. Call with one frame per tick (single camera read)."""
         frame = overlay.detector.get_frame()
         if frame is None:
             return
-        
+
         # Convert to RGB for MediaPipe
         image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
         image_rgb.flags.writeable = False
@@ -370,18 +397,22 @@ def main_new_ui(args):
         else:
             point_history.append([0, 0])
             current_gesture[0] = "Gesture: (no hand detected)"
-    
+
+        # Update overlay with this frame and gesture (single source of truth; no second get_frame)
+        overlay.set_camera_frame(frame)
+        overlay.set_gesture_label(current_gesture[0])
+        overlay.update_frame()
+
     # Override the detector's get_gesture_label to return actual gesture
-    original_get_gesture_label = overlay.detector.get_gesture_label
     def get_gesture_label_override():
         return current_gesture[0]
     overlay.detector.get_gesture_label = get_gesture_label_override
-    
-    # Create a timer to run gesture processing alongside the frame updates
+
+    # Single timer: one camera read per tick, then process and update overlay
     gesture_timer = QTimer()
     gesture_timer.timeout.connect(process_frame)
     gesture_timer.start(30)  # ~33 FPS
-    
+
     # Show the overlay
     overlay.show()
     
@@ -420,24 +451,25 @@ def main_old_ui(args):
 
     # Determine number of threads for TensorFlow Lite
     if args.high_performance:
-        num_threads = args.num_threads if args.num_threads is not None else 4
+        num_threads = args.num_threads if args.num_threads is not None else 8
     else:
         num_threads = args.num_threads if args.num_threads is not None else 1
-    
-    keypoint_classifier = KeyPointClassifier(num_threads=num_threads)
 
-    point_history_classifier = PointHistoryClassifier(num_threads=num_threads)
+    base_path = get_base_path()
+    keypoint_model = os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier.tflite')
+    point_history_model = os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier.tflite')
+    keypoint_classifier = KeyPointClassifier(model_path=keypoint_model, num_threads=num_threads)
+    point_history_classifier = PointHistoryClassifier(model_path=point_history_model, num_threads=num_threads)
 
     # Read labels ###########################################################
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
+    with open(os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier_label.csv'),
               encoding='utf-8-sig') as f:
         keypoint_classifier_labels = csv.reader(f)
         keypoint_classifier_labels = [
             row[0] for row in keypoint_classifier_labels
         ]
-    with open(
-            'model/point_history_classifier/point_history_classifier_label.csv',
-            encoding='utf-8-sig') as f:
+    with open(os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier_label.csv'),
+              encoding='utf-8-sig') as f:
         point_history_classifier_labels = csv.reader(f)
         point_history_classifier_labels = [
             row[0] for row in point_history_classifier_labels
@@ -535,25 +567,29 @@ def main_old_ui(args):
     mouse_update_interval = 1.0 / mouse_update_rate
     last_mouse_update_time = 0.0
     
-    # Thread-safe mouse movement queue for high-performance mode
+    # Thread-safe mouse movement queue for high-performance mode (Event + sentinel for clean shutdown)
     mouse_queue = queue.Queue(maxsize=1) if args.high_performance and pyautogui else None
-    mouse_thread_running = False
-    
+    mouse_stop_event = threading.Event() if (args.high_performance and pyautogui) else None
+    _MOUSE_SENTINEL = object()  # unique sentinel to signal worker to exit
+
     def mouse_worker():
-        """Background thread for mouse movement to avoid blocking main loop"""
-        while mouse_thread_running:
+        """Background thread for mouse movement; exits when sentinel is received or stop event is set."""
+        while not mouse_stop_event.is_set():
             try:
-                x, y = mouse_queue.get(timeout=0.1)
+                item = mouse_queue.get(timeout=0.1)
+                if item is _MOUSE_SENTINEL:
+                    mouse_queue.task_done()
+                    break
+                x, y = item
                 pyautogui.moveTo(x, y, duration=0.0)
                 mouse_queue.task_done()
             except queue.Empty:
                 continue
             except Exception:
                 pass
-    
+
     # Start mouse worker thread if in high-performance mode
-    if mouse_queue is not None:
-        mouse_thread_running = True
+    if mouse_queue is not None and mouse_stop_event is not None:
         mouse_thread = threading.Thread(target=mouse_worker, daemon=True)
         mouse_thread.start()
     
@@ -805,11 +841,15 @@ def main_old_ui(args):
         # Screen reflection #############################################################
         cv.imshow('Hand Gesture Recognition', debug_image)
 
-    # Cleanup
-    if mouse_queue is not None:
-        mouse_thread_running = False
-        mouse_thread.join(timeout=1.0)
-    
+    # Cleanup: signal mouse worker to exit and wait for it
+    if mouse_queue is not None and mouse_stop_event is not None:
+        mouse_stop_event.set()
+        try:
+            mouse_queue.put_nowait(_MOUSE_SENTINEL)
+        except queue.Full:
+            pass
+        mouse_thread.join(timeout=1.5)
+
     cap.release()
     cv.destroyAllWindows()
 
