@@ -11,8 +11,17 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter
 import ctypes
 import cv2
+import os
+import sys
 from Capture import GestureDetector
 
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 class OverlayWindow(QWidget):
     def __init__(self):
@@ -56,7 +65,7 @@ class OverlayWindow(QWidget):
         # --- Gesture instruction table ---
         self.gesture_table = QTableWidget(self)
         self.gesture_table.setColumnCount(3)
-        self.gesture_table.setRowCount(5)
+        self.gesture_table.setRowCount(7)
         self.gesture_table.setHorizontalHeaderLabels(["Gesture", "Action", "Description"])
         self.gesture_table.verticalHeader().setVisible(False)
         self.gesture_table.horizontalHeader().setStretchLastSection(True)
@@ -65,7 +74,7 @@ class OverlayWindow(QWidget):
         # Allow table and rows to grow vertically
         self.gesture_table.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
         self.gesture_table.setMinimumWidth(600)
-        self.gesture_table.setMinimumHeight(400)
+        self.gesture_table.setMinimumHeight(620)
 
         # Style
         self.gesture_table.setStyleSheet("""
@@ -98,11 +107,13 @@ class OverlayWindow(QWidget):
 
         # Placeholder rows
         placeholders = [
-            ("Open Palm", "Open a new browser tab (Ctrl + T)", "The palm of the user is facing the camera with all fingers extended and clearly visible."),
-            ("Fist", "Close the current tab. (Ctrl + W)", "The user's hand will be closed."),
-            ("Thumbs Up", "Volume Up (system control)", "The thumb of the user will be upwards, other fingers folded."),
-            ("Thumbs Down", "Volume Down (system control)", "The thumb of the user will be downwards, other fingers folded."),
-            ("Index Finger Up", "Play media (Spacebar)", "The index finger of the user will be raised, others folded."),
+            ("Four Fingers Up", "Open a new browser tab (Ctrl + T)", ""),
+            ("Index and Pinky Fingers Up", "Close the current tab. (Ctrl + W)", ""),
+            ("Thumbs Up", "Volume Up (system control)", ""),
+            ("Thumbs Down", "Volume Down (system control)", ""),
+            ("Two Fingers Up", "Play media (Spacebar)", ""),
+            ("Three Fingers Up","Will go back one tab (alt + left)",""),
+            ("Pinch","Starting from Index and Thumb out, moving to Pinch will click the mouse","")
         ]
 
         for row, (gesture, action, desc) in enumerate(placeholders):
@@ -111,6 +122,14 @@ class OverlayWindow(QWidget):
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
                 item.setFlags(item.flags() ^ Qt.ItemIsEditable)
                 self.gesture_table.setItem(row, col, item)
+
+        self.add_image_to_cell(0, 2, resource_path("icons/fourfu.png"))
+        self.add_image_to_cell(1, 2, resource_path("icons/rock.png"))
+        self.add_image_to_cell(2, 2, resource_path("icons/tup.png"))
+        self.add_image_to_cell(3, 2, resource_path("icons/tdown.png"))
+        self.add_image_to_cell(4, 2, resource_path("icons/twofu.png"))
+        self.add_image_to_cell(5, 2, resource_path("icons/threefu.png"))
+        self.add_image_to_cell(6, 2, resource_path("icons/pinch.png"))
 
         # Resize rows/columns to fit content
         self.gesture_table.resizeColumnsToContents()
@@ -143,7 +162,27 @@ class OverlayWindow(QWidget):
         # --- Show window and make click-through ---
         self.show()
         self.set_clickthrough_windows()
+    
 
+   
+
+    def add_image_to_cell(self, row, col, image_path, size=(120, 80)):
+        label = QLabel()
+        pixmap = QPixmap(image_path)
+
+        if not pixmap.isNull():
+            label.setPixmap(
+                pixmap.scaled(
+                    size[0],
+                    size[1],
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+            )
+
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet("background: transparent;")
+        self.gesture_table.setCellWidget(row, col, label)
     # ----------------------------
     # Windows click-through / keyboard-through
     # ----------------------------
