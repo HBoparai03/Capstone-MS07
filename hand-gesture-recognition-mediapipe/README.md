@@ -50,36 +50,55 @@ pip install pillow
 
 ```
 
-### Run Code
+### Run Code (default = best settings: new UI, high performance, 8 threads, 120 Hz mouse)
 ```bash
 python app.py
 ```
 
-# Max FPS Configuration
-```bash
-python app.py --high_performance --num_threads 8 --draw_quality medium --mouse_update_rate 120 --min_mouse_movement 2
-```
-
-### For Balanced Performance/Quality
-```bash
-python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --ui new
-```
-
-### For Low-End Systems
-```bash
-python app.py --draw_quality low --mouse_update_rate 30 --min_mouse_movement 5
-```
-
-### Run the classic OpenCV window UI (default)
-```bash
-python app.py
-```
-
-### Or explicitly:
+### Use classic OpenCV window UI instead
 ```bash
 python app.py --ui old
 ```
 
+### For balanced performance/quality
+```bash
+python app.py --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2
+```
+
+### For low-end systems
+```bash
+python app.py --no_high_performance --draw_quality low --mouse_update_rate 30 --min_mouse_movement 5
+```
+
+### Defaults (same as “Run Code” above)
+- `--ui new` (PyQt5 overlay)
+- `--high_performance` (use `--no_high_performance` to disable)
+- `--num_threads 8` (when high performance)
+- `--draw_quality medium`
+- `--mouse_update_rate 120`
+- `--min_mouse_movement 2`
+
+---
+
+# Build EXE (PyInstaller)
+
+Install PyInstaller in the same environment:
+
+```bash
+pip install pyinstaller
+```
+
+Build the single-file executable (uses default/best settings when you double‑click):
+
+```bash
+pyinstaller hand_gesture_app.spec
+```
+
+The executable is created at `dist\HandGestureRecognition.exe`. Run it as-is; no need to pass arguments unless you want to override defaults (e.g. run from a terminal with `HandGestureRecognition.exe --ui old`).
+
+### Requirements for building
+- Use the same Python version and dependencies as for running the app (e.g. Python 3.10, TensorFlow 2.15, MediaPipe, PyQt5, etc.).
+- First run and test with `python app.py` in that environment, then run the spec above.
 ### Run the new PyQt5 overlay UI
 ```bash
 python app.py --ui new
