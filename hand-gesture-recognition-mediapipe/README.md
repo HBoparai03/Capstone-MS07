@@ -62,7 +62,7 @@ python app.py --high_performance --num_threads 8 --draw_quality medium --mouse_u
 
 ### For Balanced Performance/Quality
 ```bash
-python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --ui new --gesturehand right --mousehand left
+python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --ui new
 ```
 
 ### For Low-End Systems
@@ -85,12 +85,9 @@ python app.py --ui old
 python app.py --ui new
 ```
 
-# Hand assignment (gesture hand vs mouse hand)
-```bash
-python app.py --gesturehand right --mousehand left
-```
+# Hand Assignment & Mouse Toggle (System Tray)
+Gesture hand and mouse control are managed at runtime via the system tray icon:
+- **Toggle Left/Right** — swaps the gesture hand; the mouse hand is always the opposite.
+- **Toggle Mouse** — enables or disables cursor control on the mouse hand.
 
-Example: left hand for gestures, right hand for cursor:
-```bash
-python app.py --gesturehand left --mousehand right
-```
+The `--gesturehand` flag can still be passed to set the *initial* gesture hand (defaults to `right`). The `--mousehand` flag is no longer needed since it is derived automatically.
