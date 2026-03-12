@@ -221,6 +221,9 @@ def main_new_ui(args):
     # Debounce for hotkey actions
     last_hotkey_time = [0.0]
     hotkey_cooldown_sec = 1.5
+    # Debounce for pinch clicks
+    last_pinch_click_time = [0.0]
+    pinch_click_cooldown_sec = 1.0
     # Gesture hold time tracking
     first_detected_time = {}  # When each gesture was first detected
     last_activated_time = {}  # When each gesture was last activated
@@ -361,12 +364,15 @@ def main_new_ui(args):
                 else:
                     prev_mouse_pos[0] = None
                 
-                # Pinch on gesture hand = left click (immediate, no hold/cooldown)
+                # Pinch on gesture hand = left click (with 1-second debounce)
                 if pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                    try:
-                        pyautogui.click()
-                    except Exception:
-                        pass
+                    now = time.time()
+                    if now - last_pinch_click_time[0] >= pinch_click_cooldown_sec:
+                        try:
+                            pyautogui.click()
+                            last_pinch_click_time[0] = now
+                        except Exception:
+                            pass
                 
                 # Hotkey actions (gesture hand only)
                 if pyautogui is not None and is_gesture_hand:
@@ -595,6 +601,9 @@ def main_old_ui(args):
     # Debounce for hotkey actions
     last_hotkey_time = 0.0
     hotkey_cooldown_sec = 1.5
+    # Debounce for pinch clicks
+    last_pinch_click_time = 0.0
+    pinch_click_cooldown_sec = 1.0
 
     # Gesture hold time tracking
     first_detected_time = {}  # When each gesture was first detected
@@ -815,12 +824,15 @@ def main_old_ui(args):
                     # Reset previous mouse position when not in pointer (move) mode
                     prev_mouse_pos = None
 
-                # Pinch on gesture hand = left click (immediate, no hold/cooldown)
+                # Pinch on gesture hand = left click (with 1-second debounce)
                 if mode == 0 and pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                    try:
-                        pyautogui.click()
-                    except Exception:
-                        pass
+                    now = time.time()
+                    if now - last_pinch_click_time >= pinch_click_cooldown_sec:
+                        try:
+                            pyautogui.click()
+                            last_pinch_click_time = now
+                        except Exception:
+                            pass
 
                 # Hotkey actions: Gesture -> Keyboard shortcut (gesture hand only)
                 # - Only when not in logging modes (mode == 0)
