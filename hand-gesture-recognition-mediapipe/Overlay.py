@@ -107,8 +107,8 @@ class OverlayWindow(QWidget):
 
         # Placeholder rows
         placeholders = [
-            ("Four Fingers Up", "Open a new browser tab (Ctrl + T)", ""),
-            ("Index and Pinky Fingers Up", "Close the current tab. (Ctrl + W)", ""),
+            ("OK Sign", "Open a new browser tab (Ctrl + T)", ""),
+            ("Four Fingers Up", "Close the current tab. (Ctrl + W)", ""),
             ("Thumbs Up", "Volume Up (system control)", ""),
             ("Thumbs Down", "Volume Down (system control)", ""),
             ("Two Fingers Up", "Play media (Spacebar)", ""),
@@ -123,8 +123,8 @@ class OverlayWindow(QWidget):
                 item.setFlags(item.flags() ^ Qt.ItemIsEditable)
                 self.gesture_table.setItem(row, col, item)
 
-        self.add_image_to_cell(0, 2, resource_path("icons/fourfu.png"))
-        self.add_image_to_cell(1, 2, resource_path("icons/rock.png"))
+        self.add_image_to_cell(0, 2, resource_path("icons/Ok.png"))
+        self.add_image_to_cell(1, 2, resource_path("icons/fourfu.png"))
         self.add_image_to_cell(2, 2, resource_path("icons/tup.png"))
         self.add_image_to_cell(3, 2, resource_path("icons/tdown.png"))
         self.add_image_to_cell(4, 2, resource_path("icons/twofu.png"))
