@@ -20,6 +20,7 @@ datas = [
     (os.path.join(point_history_dir, 'point_history_classifier_label.csv'), point_history_dir),
     (os.path.join(mp_root, 'modules'), 'mediapipe/modules'),
     ('icon.ico', '.'),
+    ('icons', 'icons'),
 ]
 
 # Hidden imports often needed by TensorFlow, OpenCV, PyQt5, pystray
