@@ -178,10 +178,12 @@ def main_new_ui(args):
     
     open_label_index = get_label_index(keypoint_classifier_labels, 'Open')
     close_label_index = get_label_index(keypoint_classifier_labels, 'Close')
+    ok_label_index = get_label_index(keypoint_classifier_labels, 'OK')
     thumbs_up_label_index = get_label_index(keypoint_classifier_labels, 'Thumbs Up')
     thumbs_down_label_index = get_label_index(keypoint_classifier_labels, 'Thumbs Down')
     two_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Two Fingers Up')
     three_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Three Fingers Up')
+    four_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Four Fingers Up')
     pointer_label_index = get_label_index(keypoint_classifier_labels, 'Pointer')
     pinch_label_index = get_label_index(keypoint_classifier_labels, 'Pinch')
     
@@ -369,13 +371,13 @@ def main_new_ui(args):
                 # Hotkey actions (gesture hand only)
                 if pyautogui is not None and is_gesture_hand:
                     now = time.time()
-                    if open_label_index is not None and hand_sign_id == open_label_index:
+                    if ok_label_index is not None and hand_sign_id == ok_label_index:
                         if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('ctrl', 't')
                             except Exception:
                                 pass
-                    elif close_label_index is not None and hand_sign_id == close_label_index:
+                    elif four_fingers_up_label_index is not None and hand_sign_id == four_fingers_up_label_index:
                         if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('ctrl', 'w')
@@ -526,6 +528,11 @@ def main_old_ui(args):
         close_label_index = None
     
     try:
+        ok_label_index = keypoint_classifier_labels.index('OK')
+    except ValueError:
+        ok_label_index = None
+
+    try:
         thumbs_up_label_index = keypoint_classifier_labels.index('Thumbs Up')
     except ValueError:
         thumbs_up_label_index = None
@@ -544,6 +551,11 @@ def main_old_ui(args):
         three_fingers_up_label_index = keypoint_classifier_labels.index('Three Fingers Up')
     except ValueError:
         three_fingers_up_label_index = None
+
+    try:
+        four_fingers_up_label_index = keypoint_classifier_labels.index('Four Fingers Up')
+    except ValueError:
+        four_fingers_up_label_index = None
 
     try:
         pinch_label_index = keypoint_classifier_labels.index('Pinch')
@@ -816,17 +828,17 @@ def main_old_ui(args):
                 # - Requires pyautogui to be available
                 if mode == 0 and pyautogui is not None and is_gesture_hand:
                     now = time.time()
-                    # Open hand -> Ctrl+T (new tab)
-                    if (open_label_index is not None and
-                            hand_sign_id == open_label_index):
+                    # OK sign -> Ctrl+T (new tab)
+                    if (ok_label_index is not None and
+                            hand_sign_id == ok_label_index):
                         if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('ctrl', 't')
                             except Exception:
                                 pass
-                    # Close fist -> Ctrl+W (close tab)
-                    elif (close_label_index is not None and
-                          hand_sign_id == close_label_index):
+                    # Four Fingers Up -> Ctrl+W (close tab)
+                    elif (four_fingers_up_label_index is not None and
+                          hand_sign_id == four_fingers_up_label_index):
                         if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('ctrl', 'w')
