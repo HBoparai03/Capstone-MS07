@@ -116,6 +116,14 @@ def get_args():
                         type=str,
                         default='left',
                         choices=['left', 'right'])
+    parser.add_argument("--gesture_hold_time",
+                        help='Seconds to hold a gesture before it activates',
+                        type=float,
+                        default=2)
+    parser.add_argument("--gesture_cooldown",
+                        help='Cooldown in seconds between re-triggering the same gesture',
+                        type=float,
+                        default=1.5)
 
     args = parser.parse_args()
 
@@ -211,6 +219,34 @@ def main_new_ui(args):
     # Debounce for hotkey actions
     last_hotkey_time = [0.0]
     hotkey_cooldown_sec = 1.5
+    # Gesture hold time tracking
+    first_detected_time = {}  # When each gesture was first detected
+    last_activated_time = {}  # When each gesture was last activated
+    gesture_hold_time_sec = args.gesture_hold_time
+    gesture_cooldown_sec = args.gesture_cooldown
+
+    def can_activate_gesture(label, now):
+        # Check if gesture has been held long enough
+        if label not in first_detected_time:
+            first_detected_time[label] = now
+            return False
+        
+        hold_duration = now - first_detected_time[label]
+        if hold_duration < gesture_hold_time_sec:
+            return False
+        
+        # Check cooldown after activation
+        last_activated = last_activated_time.get(label, 0.0)
+        if now - last_activated < gesture_cooldown_sec:
+            return False
+        
+        last_activated_time[label] = now
+        return True
+    
+    def reset_gesture_hold(label):
+        # Call this when a gesture is no longer detected
+        if label in first_detected_time:
+            del first_detected_time[label]
     
     # Create the Qt application
     app = QApplication(sys.argv)
@@ -223,6 +259,8 @@ def main_new_ui(args):
     
     # Store gesture state for the overlay
     current_gesture = ["Gesture: (awaiting detection...)"]
+    last_gesture_label = {}  # Track previous gesture per hand to detect changes
+    
 
     # Single camera read per tick: app timer drives frame + gesture; overlay only displays.
     overlay.set_app_driven(True)
@@ -254,6 +292,13 @@ def main_new_ui(args):
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
                 hand_sign_label = keypoint_classifier_labels[hand_sign_id]
                 hand_label = handedness.classification[0].label
+                
+                # Reset gesture hold if gesture changed
+                hand_id = hand_label
+                if hand_id in last_gesture_label and last_gesture_label[hand_id] != hand_sign_label:
+                    reset_gesture_hold(last_gesture_label[hand_id])
+                last_gesture_label[hand_id] = hand_sign_label
+                
                 is_gesture_hand = (hand_label == tray.gesture_hand)
                 is_mouse_hand = (hand_label == tray.mouse_hand) and tray.mouse_enabled
                 is_pointer_gesture = (pointer_label_index is not None and 
@@ -314,68 +359,62 @@ def main_new_ui(args):
                 else:
                     prev_mouse_pos[0] = None
                 
-                # Pinch on gesture hand = left click
+                # Pinch on gesture hand = left click (immediate, no hold/cooldown)
                 if pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                    now = time.time()
-                    if now - last_hotkey_time[0] > hotkey_cooldown_sec:
-                        try:
-                            pyautogui.click()
-                            last_hotkey_time[0] = now
-                        except Exception:
-                            pass
+                    try:
+                        pyautogui.click()
+                    except Exception:
+                        pass
                 
                 # Hotkey actions (gesture hand only)
                 if pyautogui is not None and is_gesture_hand:
                     now = time.time()
-                    if now - last_hotkey_time[0] > hotkey_cooldown_sec:
-                        if open_label_index is not None and hand_sign_id == open_label_index:
+                    if open_label_index is not None and hand_sign_id == open_label_index:
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('ctrl', 't')
-                                last_hotkey_time[0] = now
                             except Exception:
                                 pass
-                        elif close_label_index is not None and hand_sign_id == close_label_index:
+                    elif close_label_index is not None and hand_sign_id == close_label_index:
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('ctrl', 'w')
-                                last_hotkey_time[0] = now
                             except Exception:
                                 pass
                 
                 # Volume control (gesture hand only)
                 if volume_interface is not None and is_gesture_hand:
                     now = time.time()
-                    if now - last_hotkey_time[0] > hotkey_cooldown_sec:
-                        if thumbs_up_label_index is not None and hand_sign_id == thumbs_up_label_index:
+                    if thumbs_up_label_index is not None and hand_sign_id == thumbs_up_label_index:
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 current_volume = volume_interface.GetMasterVolumeLevelScalar()
                                 new_volume = min(1.0, current_volume + 0.05)
                                 volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
-                                last_hotkey_time[0] = now
                             except Exception:
                                 pass
-                        elif thumbs_down_label_index is not None and hand_sign_id == thumbs_down_label_index:
+                    elif thumbs_down_label_index is not None and hand_sign_id == thumbs_down_label_index:
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 current_volume = volume_interface.GetMasterVolumeLevelScalar()
                                 new_volume = max(0.0, current_volume - 0.05)
                                 volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
-                                last_hotkey_time[0] = now
                             except Exception:
                                 pass
                 
                 # Play/Pause and Go back (gesture hand only)
                 if pyautogui is not None and is_gesture_hand:
                     now = time.time()
-                    if now - last_hotkey_time[0] > hotkey_cooldown_sec:
-                        if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
+                    if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.press('playpause')
-                                last_hotkey_time[0] = now
                             except Exception:
                                 pass
-                        elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
+                    elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('alt', 'left')
-                                last_hotkey_time[0] = now
                             except Exception:
                                 pass
                 
@@ -545,6 +584,35 @@ def main_old_ui(args):
     last_hotkey_time = 0.0
     hotkey_cooldown_sec = 1.5
 
+    # Gesture hold time tracking
+    first_detected_time = {}  # When each gesture was first detected
+    last_activated_time = {}  # When each gesture was last activated
+    gesture_hold_time_sec = args.gesture_hold_time
+    gesture_cooldown_sec = args.gesture_cooldown
+
+    def can_activate_gesture(label, now):
+        # Check if gesture has been held long enough
+        if label not in first_detected_time:
+            first_detected_time[label] = now
+            return False
+        
+        hold_duration = now - first_detected_time[label]
+        if hold_duration < gesture_hold_time_sec:
+            return False
+        
+        # Check cooldown after activation
+        last_activated = last_activated_time.get(label, 0.0)
+        if now - last_activated < gesture_cooldown_sec:
+            return False
+        
+        last_activated_time[label] = now
+        return True
+    
+    def reset_gesture_hold(label):
+        # Call this when a gesture is no longer detected
+        if label in first_detected_time:
+            del first_detected_time[label]
+
     # Air mouse control variables
     enable_air_mouse = True  # Always enabled
     mouse_sensitivity = args.mouse_sensitivity
@@ -598,6 +666,9 @@ def main_old_ui(args):
     draw_landmarks_enabled = draw_quality != 'low'
     draw_point_history_enabled = draw_quality != 'low'
     draw_info_enabled = True  # Always show FPS
+    
+    # Track previous gesture per hand to detect changes
+    last_gesture_label = {}
 
     while True:
         fps = cvFpsCalc.get()
@@ -643,7 +714,15 @@ def main_old_ui(args):
 
                 # Hand sign classification
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
+                hand_sign_label = keypoint_classifier_labels[hand_sign_id]
                 hand_label = handedness.classification[0].label  # "Left" or "Right"
+                
+                # Reset gesture hold if gesture changed
+                hand_id = hand_label
+                if hand_id in last_gesture_label and last_gesture_label[hand_id] != hand_sign_label:
+                    reset_gesture_hold(last_gesture_label[hand_id])
+                last_gesture_label[hand_id] = hand_sign_label
+                
                 is_gesture_hand = (hand_label == gesture_hand_label)
                 is_mouse_hand = (hand_label == mouse_hand_label)
                 is_pointer_gesture = (pointer_label_index is not None and 
@@ -724,67 +803,62 @@ def main_old_ui(args):
                     # Reset previous mouse position when not in pointer (move) mode
                     prev_mouse_pos = None
 
-                # Pinch on gesture hand = left click (so gesture hand can click without moving cursor)
+                # Pinch on gesture hand = left click (immediate, no hold/cooldown)
                 if mode == 0 and pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                    now = time.time()
-                    if now - last_hotkey_time > hotkey_cooldown_sec:
-                        try:
-                            pyautogui.click()
-                            last_hotkey_time = now
-                        except Exception:
-                            pass
+                    try:
+                        pyautogui.click()
+                    except Exception:
+                        pass
 
                 # Hotkey actions: Gesture -> Keyboard shortcut (gesture hand only)
                 # - Only when not in logging modes (mode == 0)
-                # - Debounced to avoid repeated triggers
+                # - Per-gesture cooldown to avoid repeated triggers
                 # - Requires pyautogui to be available
                 if mode == 0 and pyautogui is not None and is_gesture_hand:
                     now = time.time()
-                    if now - last_hotkey_time > hotkey_cooldown_sec:
-                        # Open hand -> Ctrl+T (new tab)
-                        if (open_label_index is not None and
-                                hand_sign_id == open_label_index):
+                    # Open hand -> Ctrl+T (new tab)
+                    if (open_label_index is not None and
+                            hand_sign_id == open_label_index):
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('ctrl', 't')
-                                last_hotkey_time = now
                             except Exception:
                                 pass
-                        # Close fist -> Ctrl+W (close tab)
-                        elif (close_label_index is not None and
-                              hand_sign_id == close_label_index):
+                    # Close fist -> Ctrl+W (close tab)
+                    elif (close_label_index is not None and
+                          hand_sign_id == close_label_index):
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('ctrl', 'w')
-                                last_hotkey_time = now
                             except Exception:
                                 pass
                 
                 # Volume control: Gesture -> Volume adjustment (gesture hand only)
                 # - Only when not in logging modes (mode == 0)
-                # - Debounced to avoid repeated triggers
+                # - Per-gesture cooldown to avoid repeated triggers
                 # - Requires volume control to be available
                 if mode == 0 and volume_interface is not None and is_gesture_hand:
                     now = time.time()
-                    if now - last_hotkey_time > hotkey_cooldown_sec:
-                        # Thumbs Up -> Increase volume
-                        if (thumbs_up_label_index is not None and
-                                hand_sign_id == thumbs_up_label_index):
+                    # Thumbs Up -> Increase volume
+                    if (thumbs_up_label_index is not None and
+                            hand_sign_id == thumbs_up_label_index):
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 current_volume = volume_interface.GetMasterVolumeLevelScalar()
                                 # Increase volume by 5% (0.05)
                                 new_volume = min(1.0, current_volume + 0.05)
                                 volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
-                                last_hotkey_time = now
                             except Exception:
                                 pass
-                        # Thumbs Down -> Decrease volume
-                        elif (thumbs_down_label_index is not None and
-                              hand_sign_id == thumbs_down_label_index):
+                    # Thumbs Down -> Decrease volume
+                    elif (thumbs_down_label_index is not None and
+                          hand_sign_id == thumbs_down_label_index):
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 current_volume = volume_interface.GetMasterVolumeLevelScalar()
                                 # Decrease volume by 5% (0.05)
                                 new_volume = max(0.0, current_volume - 0.05)
                                 volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
-                                last_hotkey_time = now
                             except Exception:
                                 pass
                 
@@ -792,17 +866,16 @@ def main_old_ui(args):
                 # Three Fingers Up -> Go back (Alt+Left) (gesture hand only)
                 if mode == 0 and pyautogui is not None and is_gesture_hand:
                     now = time.time()
-                    if now - last_hotkey_time > hotkey_cooldown_sec:
-                        if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
+                    if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.press('playpause')
-                                last_hotkey_time = now
                             except Exception:
                                 pass
-                        elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
+                    elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
+                        if can_activate_gesture(hand_sign_label, now):
                             try:
                                 pyautogui.hotkey('alt', 'left')
-                                last_hotkey_time = now
                             except Exception:
                                 pass
 
