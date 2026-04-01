@@ -265,5 +265,7 @@ class OverlayWindow(QWidget):
     # Cleanup
     # ----------------------------
     def closeEvent(self, event):
+        if hasattr(self, "timer"):
+            self.timer.stop()
         self.detector.release()
         event.accept()
