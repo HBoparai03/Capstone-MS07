@@ -133,7 +133,7 @@ def get_args():
 def main_new_ui(args):
     """Run the new PyQt5 overlay UI with gesture recognition."""
     from PyQt5.QtWidgets import QApplication
-    from PyQt5.QtCore import QTimer
+    from PyQt5.QtCore import QTimer, Qt
     from Overlay import OverlayWindow
     from Tray import TrayIcon
     
@@ -265,200 +265,212 @@ def main_new_ui(args):
     # Store gesture state for the overlay
     current_gesture = ["Gesture: (awaiting detection...)"]
     last_gesture_label = {}  # Track previous gesture per hand to detect changes
+    processing_stop_event = threading.Event()
     
 
-    # Single camera read per tick: app timer drives frame + gesture; overlay only displays.
+    # Single camera read per tick: worker drives frame + gesture; overlay only displays.
     overlay.set_app_driven(True)
 
-    def process_frame():
-        """Process a frame and perform gesture recognition. Call with one frame per tick (single camera read)."""
-        frame = overlay.detector.get_frame()
-        if frame is None:
-            return
+    def process_frame_loop():
+        """Process frames on a worker thread and publish the latest frame to the overlay."""
+        target_interval = 1.0 / 30.0
 
-        # Convert to RGB for MediaPipe
-        image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-        image_rgb.flags.writeable = False
-        results = hands.process(image_rgb)
-        image_rgb.flags.writeable = True
-        
-        if results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
-                                                  results.multi_handedness):
-                # Landmark calculation
-                landmark_list = calc_landmark_list(frame, hand_landmarks)
-                
-                # Conversion to relative coordinates / normalized coordinates
-                pre_processed_landmark_list = pre_process_landmark(landmark_list)
-                pre_processed_point_history_list = pre_process_point_history(
-                    frame, point_history)
-                
-                # Hand sign classification
-                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-                hand_sign_label = keypoint_classifier_labels[hand_sign_id]
-                hand_label = handedness.classification[0].label
-                
-                # Reset gesture hold if gesture changed
-                hand_id = hand_label
-                if hand_id in last_gesture_label and last_gesture_label[hand_id] != hand_sign_label:
-                    reset_gesture_hold(last_gesture_label[hand_id])
-                last_gesture_label[hand_id] = hand_sign_label
-                
-                is_gesture_hand = (hand_label == tray.gesture_hand)
-                is_mouse_hand = (hand_label == tray.mouse_hand) and tray.mouse_enabled
-                is_pointer_gesture = (pointer_label_index is not None and 
-                                     hand_sign_id == pointer_label_index)
-                is_pinch_gesture = (pinch_label_index is not None and 
-                                    hand_sign_id == pinch_label_index)
-                is_mouse_move_gesture = is_pointer_gesture and is_mouse_hand
-                if is_pointer_gesture or is_pinch_gesture:
-                    point_history.append(landmark_list[8])
-                else:
-                    point_history.append([0, 0])
-                
-                if is_mouse_move_gesture:
-                    # Air mouse control (Pointer on mouse hand = move cursor)
-                    if pyautogui is not None:
-                        cap_width = frame.shape[1]
-                        cap_height = frame.shape[0]
-                        index_finger_tip = landmark_list[8]
-                        
-                        normalized_x = index_finger_tip[0] / cap_width
-                        normalized_y = index_finger_tip[1] / cap_height
-                        
-                        effective_x = (normalized_x - 0.5) * mouse_sensitivity + 0.5
-                        effective_y = (normalized_y - 0.5) * mouse_sensitivity + 0.5
-                        effective_x = max(0.0, min(1.0, effective_x))
-                        effective_y = max(0.0, min(1.0, effective_y))
-                        
-                        screen_x = int(effective_x * screen_width)
-                        screen_y = int(effective_y * screen_height)
-                        
-                        if prev_mouse_pos[0] is not None:
-                            screen_x = int(screen_x * (1 - mouse_smoothing) + prev_mouse_pos[0][0] * mouse_smoothing)
-                            screen_y = int(screen_y * (1 - mouse_smoothing) + prev_mouse_pos[0][1] * mouse_smoothing)
-                        
-                        screen_x = max(0, min(screen_width - 1, screen_x))
-                        screen_y = max(0, min(screen_height - 1, screen_y))
-                        
+        while not processing_stop_event.is_set():
+            loop_started = time.perf_counter()
+            frame = overlay.detector.get_frame()
+            if frame is None:
+                processing_stop_event.wait(0.01)
+                continue
+
+            image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            image_rgb.flags.writeable = False
+            results = hands.process(image_rgb)
+            image_rgb.flags.writeable = True
+
+            if results.multi_hand_landmarks is not None:
+                for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
+                                                      results.multi_handedness):
+                    landmark_list = calc_landmark_list(frame, hand_landmarks)
+                    pre_processed_landmark_list = pre_process_landmark(landmark_list)
+                    pre_processed_point_history_list = pre_process_point_history(frame, point_history)
+
+                    hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
+                    hand_sign_label = keypoint_classifier_labels[hand_sign_id]
+                    hand_label = handedness.classification[0].label
+
+                    hand_id = hand_label
+                    if hand_id in last_gesture_label and last_gesture_label[hand_id] != hand_sign_label:
+                        reset_gesture_hold(last_gesture_label[hand_id])
+                    last_gesture_label[hand_id] = hand_sign_label
+
+                    is_gesture_hand = (hand_label == tray.gesture_hand)
+                    is_mouse_hand = (hand_label == tray.mouse_hand) and tray.mouse_enabled
+                    is_pointer_gesture = (pointer_label_index is not None and hand_sign_id == pointer_label_index)
+                    is_pinch_gesture = (pinch_label_index is not None and hand_sign_id == pinch_label_index)
+                    is_mouse_move_gesture = is_pointer_gesture and is_mouse_hand
+                    if is_pointer_gesture or is_pinch_gesture:
+                        point_history.append(landmark_list[8])
+                    else:
+                        point_history.append([0, 0])
+
+                    if is_mouse_move_gesture:
+                        if pyautogui is not None:
+                            cap_width = frame.shape[1]
+                            cap_height = frame.shape[0]
+                            index_finger_tip = landmark_list[8]
+
+                            normalized_x = index_finger_tip[0] / cap_width
+                            normalized_y = index_finger_tip[1] / cap_height
+
+                            effective_x = (normalized_x - 0.5) * mouse_sensitivity + 0.5
+                            effective_y = (normalized_y - 0.5) * mouse_sensitivity + 0.5
+                            effective_x = max(0.0, min(1.0, effective_x))
+                            effective_y = max(0.0, min(1.0, effective_y))
+
+                            screen_x = int(effective_x * screen_width)
+                            screen_y = int(effective_y * screen_height)
+
+                            if prev_mouse_pos[0] is not None:
+                                screen_x = int(screen_x * (1 - mouse_smoothing) + prev_mouse_pos[0][0] * mouse_smoothing)
+                                screen_y = int(screen_y * (1 - mouse_smoothing) + prev_mouse_pos[0][1] * mouse_smoothing)
+
+                            screen_x = max(0, min(screen_width - 1, screen_x))
+                            screen_y = max(0, min(screen_height - 1, screen_y))
+
+                            now = time.time()
+                            should_update = False
+
+                            if prev_mouse_pos[0] is None:
+                                should_update = True
+                            else:
+                                time_since_update = now - last_mouse_update_time[0]
+                                if time_since_update >= mouse_update_interval:
+                                    dx = abs(screen_x - prev_mouse_pos[0][0])
+                                    dy = abs(screen_y - prev_mouse_pos[0][1])
+                                    if dx >= min_mouse_movement or dy >= min_mouse_movement:
+                                        should_update = True
+
+                            if should_update:
+                                try:
+                                    pyautogui.moveTo(screen_x, screen_y, duration=0.0)
+                                    prev_mouse_pos[0] = (screen_x, screen_y)
+                                    last_mouse_update_time[0] = now
+                                except Exception:
+                                    pass
+                    else:
+                        prev_mouse_pos[0] = None
+
+                    if pyautogui is not None and is_gesture_hand and is_pinch_gesture:
                         now = time.time()
-                        should_update = False
-                        
-                        if prev_mouse_pos[0] is None:
-                            should_update = True
-                        else:
-                            time_since_update = now - last_mouse_update_time[0]
-                            if time_since_update >= mouse_update_interval:
-                                dx = abs(screen_x - prev_mouse_pos[0][0])
-                                dy = abs(screen_y - prev_mouse_pos[0][1])
-                                if dx >= min_mouse_movement or dy >= min_mouse_movement:
-                                    should_update = True
-                        
-                        if should_update:
+                        if now - last_pinch_click_time[0] >= pinch_click_cooldown_sec:
                             try:
-                                pyautogui.moveTo(screen_x, screen_y, duration=0.0)
-                                prev_mouse_pos[0] = (screen_x, screen_y)
-                                last_mouse_update_time[0] = now
+                                pyautogui.click()
+                                last_pinch_click_time[0] = now
                             except Exception:
                                 pass
-                else:
-                    prev_mouse_pos[0] = None
-                
-                # Pinch on gesture hand = left click (with 1-second debounce)
-                if pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                    now = time.time()
-                    if now - last_pinch_click_time[0] >= pinch_click_cooldown_sec:
-                        try:
-                            pyautogui.click()
-                            last_pinch_click_time[0] = now
-                        except Exception:
-                            pass
-                
-                # Hotkey actions (gesture hand only)
-                if pyautogui is not None and is_gesture_hand:
-                    now = time.time()
-                    if ok_label_index is not None and hand_sign_id == ok_label_index:
-                        if can_activate_gesture(hand_sign_label, now):
-                            try:
-                                pyautogui.hotkey('ctrl', 't')
-                            except Exception:
-                                pass
-                    elif four_fingers_up_label_index is not None and hand_sign_id == four_fingers_up_label_index:
-                        if can_activate_gesture(hand_sign_label, now):
-                            try:
-                                pyautogui.hotkey('ctrl', 'w')
-                            except Exception:
-                                pass
-                
-                # Volume control (gesture hand only)
-                if volume_interface is not None and is_gesture_hand:
-                    now = time.time()
-                    if thumbs_up_label_index is not None and hand_sign_id == thumbs_up_label_index:
-                        if can_activate_gesture(hand_sign_label, now):
-                            try:
-                                current_volume = volume_interface.GetMasterVolumeLevelScalar()
-                                new_volume = min(1.0, current_volume + 0.05)
-                                volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
-                            except Exception:
-                                pass
-                    elif thumbs_down_label_index is not None and hand_sign_id == thumbs_down_label_index:
-                        if can_activate_gesture(hand_sign_label, now):
-                            try:
-                                current_volume = volume_interface.GetMasterVolumeLevelScalar()
-                                new_volume = max(0.0, current_volume - 0.05)
-                                volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
-                            except Exception:
-                                pass
-                
-                # Play/Pause and Go back (gesture hand only)
-                if pyautogui is not None and is_gesture_hand:
-                    now = time.time()
-                    if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
-                        if can_activate_gesture(hand_sign_label, now):
-                            try:
-                                pyautogui.press('playpause')
-                            except Exception:
-                                pass
-                    elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
-                        if can_activate_gesture(hand_sign_label, now):
-                            try:
-                                pyautogui.hotkey('alt', 'left')
-                            except Exception:
-                                pass
-                
-                # Finger gesture classification
-                finger_gesture_id = 0
-                point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(pre_processed_point_history_list)
-                
-                finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(finger_gesture_history).most_common()
-                
-                # Update gesture label
-                handedness_label = handedness.classification[0].label
-                finger_gesture_label = point_history_classifier_labels[most_common_fg_id[0][0]]
-                current_gesture[0] = f"{handedness_label}: {hand_sign_label}"
-                if finger_gesture_label:
-                    current_gesture[0] += f" | {finger_gesture_label}"
-        else:
-            point_history.append([0, 0])
-            current_gesture[0] = "Gesture: (no hand detected)"
 
-        # Update overlay with this frame and gesture (single source of truth; no second get_frame)
-        overlay.set_camera_frame(frame)
-        overlay.set_gesture_label(current_gesture[0])
-        overlay.update_frame()
+                    if pyautogui is not None and is_gesture_hand:
+                        now = time.time()
+                        if ok_label_index is not None and hand_sign_id == ok_label_index:
+                            if can_activate_gesture(hand_sign_label, now):
+                                try:
+                                    pyautogui.hotkey('ctrl', 't')
+                                except Exception:
+                                    pass
+                        elif four_fingers_up_label_index is not None and hand_sign_id == four_fingers_up_label_index:
+                            if can_activate_gesture(hand_sign_label, now):
+                                try:
+                                    pyautogui.hotkey('ctrl', 'w')
+                                except Exception:
+                                    pass
 
-    # Override the detector's get_gesture_label to return actual gesture
-    def get_gesture_label_override():
-        return current_gesture[0]
-    overlay.detector.get_gesture_label = get_gesture_label_override
+                    if volume_interface is not None and is_gesture_hand:
+                        now = time.time()
+                        if thumbs_up_label_index is not None and hand_sign_id == thumbs_up_label_index:
+                            if can_activate_gesture(hand_sign_label, now):
+                                try:
+                                    current_volume = volume_interface.GetMasterVolumeLevelScalar()
+                                    new_volume = min(1.0, current_volume + 0.05)
+                                    volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
+                                except Exception:
+                                    pass
+                        elif thumbs_down_label_index is not None and hand_sign_id == thumbs_down_label_index:
+                            if can_activate_gesture(hand_sign_label, now):
+                                try:
+                                    current_volume = volume_interface.GetMasterVolumeLevelScalar()
+                                    new_volume = max(0.0, current_volume - 0.05)
+                                    volume_interface.SetMasterVolumeLevelScalar(new_volume, None)
+                                except Exception:
+                                    pass
 
-    # Single timer: one camera read per tick, then process and update overlay
-    gesture_timer = QTimer()
-    gesture_timer.timeout.connect(process_frame)
-    gesture_timer.start(30)  # ~33 FPS
+                    if pyautogui is not None and is_gesture_hand:
+                        now = time.time()
+                        if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
+                            if can_activate_gesture(hand_sign_label, now):
+                                try:
+                                    pyautogui.press('playpause')
+                                except Exception:
+                                    pass
+                        elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
+                            if can_activate_gesture(hand_sign_label, now):
+                                try:
+                                    pyautogui.hotkey('alt', 'left')
+                                except Exception:
+                                    pass
+
+                    finger_gesture_id = 0
+                    point_history_len = len(pre_processed_point_history_list)
+                    if point_history_len == (history_length * 2):
+                        finger_gesture_id = point_history_classifier(pre_processed_point_history_list)
+
+                    finger_gesture_history.append(finger_gesture_id)
+                    most_common_fg_id = Counter(finger_gesture_history).most_common()
+
+                    handedness_label = handedness.classification[0].label
+                    finger_gesture_label = point_history_classifier_labels[most_common_fg_id[0][0]]
+                    current_gesture[0] = f"{handedness_label}: {hand_sign_label}"
+                    if finger_gesture_label:
+                        current_gesture[0] += f" | {finger_gesture_label}"
+            else:
+                point_history.append([0, 0])
+                current_gesture[0] = "Gesture: (no hand detected)"
+
+            overlay.set_camera_frame(frame)
+            overlay.set_gesture_label(current_gesture[0])
+
+            elapsed = time.perf_counter() - loop_started
+            remaining = target_interval - elapsed
+            if remaining > 0:
+                processing_stop_event.wait(remaining)
+
+    processing_thread = threading.Thread(target=process_frame_loop, daemon=True)
+    processing_thread.start()
+
+    display_timer = QTimer()
+    display_timer.setTimerType(Qt.PreciseTimer)
+    display_timer.timeout.connect(overlay.update_frame)
+    display_timer.start(33)
+
+    def shutdown():
+        processing_stop_event.set()
+        display_timer.stop()
+        try:
+            overlay.detector.release()
+        except Exception:
+            pass
+        try:
+            if processing_thread.is_alive():
+                processing_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        close_method = getattr(hands, 'close', None)
+        if callable(close_method):
+            try:
+                close_method()
+            except Exception:
+                pass
+
+    app.aboutToQuit.connect(shutdown)
 
     # Show the overlay
     overlay.show()
