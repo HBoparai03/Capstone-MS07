@@ -1,4 +1,4 @@
-# PyInstaller spec for Hand Gesture Recognition (best/default settings: new UI, high perf, 8 threads, etc.)
+# PyInstaller spec for Hand Gesture Recognition (one-dir build, trimmed asset set)
 # Build: pyinstaller hand_gesture_app.spec
 
 import os
@@ -20,7 +20,13 @@ datas = [
     (os.path.join(point_history_dir, 'point_history_classifier_label.csv'), point_history_dir),
     (os.path.join(mp_root, 'modules'), 'mediapipe/modules'),
     ('icon.ico', '.'),
-    ('icons', 'icons'),
+    ('icons/Ok.png', 'icons'),
+    ('icons/fourfu.png', 'icons'),
+    ('icons/pinch.png', 'icons'),
+    ('icons/tdown.png', 'icons'),
+    ('icons/threefu.png', 'icons'),
+    ('icons/tup.png', 'icons'),
+    ('icons/twofu.png', 'icons'),
 ]
 
 # Hidden imports often needed by TensorFlow, OpenCV, PyQt5, pystray
@@ -57,14 +63,13 @@ exe = EXE(
     a.scripts,
     a.binaries,
     a.zipfiles,
-    a.datas,
     [],
     name='HandGestureRecognition',
     icon='icon.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,  # No console window for GUI app
@@ -73,4 +78,16 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    exclude_binaries=True,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='HandGestureRecognition',
 )

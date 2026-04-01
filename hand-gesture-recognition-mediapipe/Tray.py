@@ -111,7 +111,7 @@ class TrayIcon:
                 q.quit()
         except Exception:
             pass
-        os._exit(0)
+        return  # Allow for a clean exit instead of forcing termination
 
     def toggle_left_right(self, icon, item):
         if self.gesture_hand == "Right":
