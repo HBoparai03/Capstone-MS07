@@ -40,7 +40,7 @@ hiddenimports = [
     'pystray', 'PIL', 'PIL._tkinter_finder',
     'pyautogui', 'comtypes', 'pycaw',
     'sounddevice', '_sounddevice', '_sounddevice_data',
-    'faster_whisper', 'ctranslate2', 'av',
+    'faster_whisper', 'ctranslate2', 'av', 'huggingface_hub',
     'mediapipe.python._framework_bindings',
     'mediapipe.python._framework_bindings.calculator_graph',
     'mediapipe.python._framework_bindings.packet',

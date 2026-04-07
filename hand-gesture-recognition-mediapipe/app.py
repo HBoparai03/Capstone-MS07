@@ -64,6 +64,7 @@ class SpeechDictationController:
 
     def __init__(self, model_name="small", sample_rate=16000, chunk_seconds=3.5, language="en"):
         self.model_name = model_name
+        self._model_dir = self._resolve_model_dir(model_name)
         self.sample_rate = sample_rate
         self.chunk_frames = int(sample_rate * chunk_seconds)
         self.language = language
@@ -196,12 +197,61 @@ class SpeechDictationController:
             self._set_runtime_error(exc)
         return None, "Unavailable"
 
+    @staticmethod
+    def _resolve_model_dir(model_name):
+        """Return the local model directory (EXE) or None (script uses HF cache)."""
+        if not getattr(sys, 'frozen', False):
+            return None  # script mode: faster-whisper resolves via HuggingFace cache
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+        return os.path.join(appdata, "HandGestureApp", "models", f"whisper-{model_name}")
+
+    def _is_model_ready(self):
+        """Return True if the model is available locally (or we are in script mode)."""
+        if self._model_dir is None:
+            return True  # script mode — let faster-whisper handle it
+        required = ["model.bin", "config.json"]
+        return os.path.isdir(self._model_dir) and all(
+            os.path.isfile(os.path.join(self._model_dir, f)) for f in required
+        )
+
+    def download_model(self):
+        """Download the Whisper model from HuggingFace into the local app data folder.
+
+        Call this once before first use in EXE mode (e.g. from an installer or
+        a one-time setup dialog). Not called automatically.
+        """
+        if self._model_dir is None:
+            return  # nothing to do in script mode
+        try:
+            from huggingface_hub import snapshot_download
+            os.makedirs(self._model_dir, exist_ok=True)
+            snapshot_download(
+                repo_id=f"Systran/faster-whisper-{self.model_name}",
+                local_dir=self._model_dir,
+            )
+        except Exception as exc:
+            self._set_runtime_error(exc)
+
     def _load_model(self):
         with self._lock:
             if self._model is not None:
                 return self._model
             self._model_loading = True
             self._last_error = ""
+
+        if not self._is_model_ready():
+            with self._lock:
+                self._available = False
+                self._model_loading = False
+                self._speech_enabled = False
+                self._last_error = "Speech model not downloaded"
+            print("[speech] Speech model not downloaded. Call download_model() first.", file=sys.stderr)
+            return None
+
+        # In EXE mode use the local folder path; in script mode use the model name
+        # so faster-whisper resolves it via the HuggingFace cache as normal.
+        model_source = self._model_dir if self._model_dir is not None else self.model_name
+
         model = None
         load_error = None
         load_attempts = (
@@ -211,7 +261,7 @@ class SpeechDictationController:
         for attempt in load_attempts:
             try:
                 model = WhisperModel(
-                    self.model_name,
+                    model_source,
                     device=attempt["device"],
                     compute_type=attempt["compute_type"],
                 )
