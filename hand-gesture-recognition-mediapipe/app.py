@@ -4,6 +4,7 @@ import csv
 import copy
 import argparse
 import itertools
+import json
 import os
 import sys
 from collections import Counter
@@ -50,9 +51,10 @@ except Exception:
     sd = None
 
 try:
-    from faster_whisper import WhisperModel
+    from vosk import Model as VoskModel, KaldiRecognizer
 except Exception:
-    WhisperModel = None
+    VoskModel = None
+    KaldiRecognizer = None
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
@@ -62,12 +64,10 @@ from model import PointHistoryClassifier
 class SpeechDictationController:
     """Persistent background speech-to-text worker controlled by gestures or tray actions."""
 
-    def __init__(self, model_name="small", sample_rate=16000, chunk_seconds=3.5, language="en"):
-        self.model_name = model_name
-        self._model_dir = self._resolve_model_dir(model_name)
+    def __init__(self, sample_rate=16000, language="en"):
         self.sample_rate = sample_rate
-        self.chunk_frames = int(sample_rate * chunk_seconds)
         self.language = language
+        self._model_path = os.path.join(get_base_path(), "vosk-model-small-en-us")
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -81,12 +81,16 @@ class SpeechDictationController:
         self._last_error = ""
         self._input_device_index = None
         self._input_device_name = "Unavailable"
-        self._available = (sd is not None and WhisperModel is not None and pyautogui is not None)
+        self._available = (sd is not None and VoskModel is not None and pyautogui is not None)
         if self._available:
-            self._input_device_index, self._input_device_name = self._resolve_input_device()
-            if self._input_device_index is None:
+            if not os.path.isdir(self._model_path):
                 self._available = False
-                self._last_error = "No input microphone found"
+                self._last_error = "Speech model not found"
+            else:
+                self._input_device_index, self._input_device_name = self._resolve_input_device()
+                if self._input_device_index is None:
+                    self._available = False
+                    self._last_error = "No input microphone found"
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -197,84 +201,21 @@ class SpeechDictationController:
             self._set_runtime_error(exc)
         return None, "Unavailable"
 
-    @staticmethod
-    def _resolve_model_dir(model_name):
-        """Return the local model directory (EXE) or None (script uses HF cache)."""
-        if not getattr(sys, 'frozen', False):
-            return None  # script mode: faster-whisper resolves via HuggingFace cache
-        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-        return os.path.join(appdata, "HandGestureApp", "models", f"whisper-{model_name}")
-
-    def _is_model_ready(self):
-        """Return True if the model is available locally (or we are in script mode)."""
-        if self._model_dir is None:
-            return True  # script mode — let faster-whisper handle it
-        required = ["model.bin", "config.json"]
-        return os.path.isdir(self._model_dir) and all(
-            os.path.isfile(os.path.join(self._model_dir, f)) for f in required
-        )
-
-    def download_model(self):
-        """Download the Whisper model from HuggingFace into the local app data folder.
-
-        Call this once before first use in EXE mode (e.g. from an installer or
-        a one-time setup dialog). Not called automatically.
-        """
-        if self._model_dir is None:
-            return  # nothing to do in script mode
-        try:
-            from huggingface_hub import snapshot_download
-            os.makedirs(self._model_dir, exist_ok=True)
-            snapshot_download(
-                repo_id=f"Systran/faster-whisper-{self.model_name}",
-                local_dir=self._model_dir,
-            )
-        except Exception as exc:
-            self._set_runtime_error(exc)
-
     def _load_model(self):
         with self._lock:
             if self._model is not None:
                 return self._model
             self._model_loading = True
             self._last_error = ""
-
-        if not self._is_model_ready():
+        try:
+            model = VoskModel(self._model_path)
+        except Exception as exc:
             with self._lock:
                 self._available = False
                 self._model_loading = False
                 self._speech_enabled = False
-                self._last_error = "Speech model not downloaded"
-            print("[speech] Speech model not downloaded. Call download_model() first.", file=sys.stderr)
-            return None
-
-        # In EXE mode use the local folder path; in script mode use the model name
-        # so faster-whisper resolves it via the HuggingFace cache as normal.
-        model_source = self._model_dir if self._model_dir is not None else self.model_name
-
-        model = None
-        load_error = None
-        load_attempts = (
-            {"device": "cpu", "compute_type": "int8"},
-            {"device": "cpu", "compute_type": "float32"},
-        )
-        for attempt in load_attempts:
-            try:
-                model = WhisperModel(
-                    model_source,
-                    device=attempt["device"],
-                    compute_type=attempt["compute_type"],
-                )
-                break
-            except Exception as exc:
-                load_error = exc
-        if model is None:
-            with self._lock:
-                self._available = False
-                self._model_loading = False
-                self._speech_enabled = False
-                self._last_error = f"{load_error.__class__.__name__}: {load_error}"
-            print(f"[speech] {load_error.__class__.__name__}: {load_error}", file=sys.stderr)
+                self._last_error = f"{exc.__class__.__name__}: {exc}"
+            print(f"[speech] {exc.__class__.__name__}: {exc}", file=sys.stderr)
             return None
         with self._lock:
             self._model = model
@@ -282,8 +223,6 @@ class SpeechDictationController:
         return model
 
     def _speech_worker(self):
-        silence_threshold = 0.01
-
         while not self._stop_event.is_set():
             with self._lock:
                 available = self._available
@@ -306,64 +245,42 @@ class SpeechDictationController:
                 continue
 
             try:
-                audio = sd.rec(
-                    self.chunk_frames,
+                rec = KaldiRecognizer(model, self.sample_rate)
+                with sd.RawInputStream(
                     samplerate=self.sample_rate,
+                    blocksize=4000,
+                    dtype="int16",
                     channels=1,
-                    dtype="float32",
                     device=self._input_device_index,
-                )
-                sd.wait()
+                ) as stream:
+                    while not self._stop_event.is_set():
+                        with self._lock:
+                            enabled = self._speech_enabled
+                        if not enabled:
+                            break
+                        data, _ = stream.read(4000)
+                        if rec.AcceptWaveform(bytes(data)):
+                            result = json.loads(rec.Result())
+                            text = result.get("text", "").strip()
+                            if not text:
+                                continue
+                            normalized = " ".join(text.split())
+                            with self._lock:
+                                self._last_transcript = normalized
+                                already_typed = normalized == self._last_typed_text
+                            if already_typed:
+                                continue
+                            try:
+                                pyautogui.write(normalized + " ", interval=0.0)
+                            except Exception as exc:
+                                self._set_runtime_error(exc)
+                                continue
+                            with self._lock:
+                                self._last_typed_text = normalized
             except Exception as exc:
                 self._set_runtime_error(exc)
                 self._wake_event.wait(0.25)
                 self._wake_event.clear()
-                continue
-
-            if self._stop_event.is_set():
-                break
-
-            with self._lock:
-                enabled = self._speech_enabled
-                self._last_error = ""
-
-            if not enabled:
-                continue
-
-            audio = np.squeeze(audio)
-            if audio.size == 0 or float(np.max(np.abs(audio))) < silence_threshold:
-                continue
-
-            try:
-                segments, _ = model.transcribe(
-                    audio,
-                    language=self.language,
-                    beam_size=5,
-                    vad_filter=True,
-                    condition_on_previous_text=False,
-                )
-                text = " ".join(segment.text.strip() for segment in segments).strip()
-            except Exception as exc:
-                self._set_runtime_error(exc)
-                continue
-
-            normalized_text = " ".join(text.split())
-            if not normalized_text:
-                continue
-
-            with self._lock:
-                self._last_transcript = normalized_text
-                if normalized_text == self._last_typed_text:
-                    continue
-
-            try:
-                pyautogui.write(normalized_text + " ", interval=0.0)
-            except Exception as exc:
-                self._set_runtime_error(exc)
-                continue
-
-            with self._lock:
-                self._last_typed_text = normalized_text
 
 
 def handle_speech_gesture(hand_sign_id, hand_sign_label, now, open_label_index, close_label_index,
