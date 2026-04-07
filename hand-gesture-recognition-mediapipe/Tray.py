@@ -84,9 +84,9 @@ class TrayIcon:
         return self.speech_controller.is_available()
 
     def _speech_status_label(self):
-        if not self._speech_available():
+        if self.speech_controller is None:
             return "Speech: Unavailable"
-        return f"Speech: {'ON' if self._speech_enabled() else 'OFF'}"
+        return self.speech_controller.get_snapshot()["status"]
 
     def _transcript_visible(self):
         if self.speech_controller is None:

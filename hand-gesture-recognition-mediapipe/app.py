@@ -14,16 +14,42 @@ if hasattr(sys, "_MEIPASS"):
     os.environ["MEDIAPIPE_RESOURCE_PATH"] = sys._MEIPASS
 
 
+def _candidate_base_paths():
+    candidates = []
+
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(sys._MEIPASS)
+
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(exe_dir)
+        candidates.append(os.path.join(exe_dir, "_internal"))
+
+    candidates.append(os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(os.path.abspath("."))
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_candidates.append(candidate)
+
+    return unique_candidates
+
+
 def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+    for base_path in _candidate_base_paths():
+        candidate = os.path.join(base_path, relative_path)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(_candidate_base_paths()[0], relative_path)
 
 def get_base_path():
     """Return base path for resources (works when run as script or as PyInstaller exe)."""
-    if getattr(sys, 'frozen', False):
-        return sys._MEIPASS
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(resource_path("app.py")) if os.path.exists(resource_path("app.py")) else _candidate_base_paths()[0]
 
 import cv2 as cv
 import numpy as np
@@ -34,8 +60,10 @@ import queue
 
 try:
     import pyautogui  # For sending Ctrl+T to active window and mouse control
-except Exception:
+    PYAUTOGUI_IMPORT_ERROR = None
+except Exception as exc:
     pyautogui = None
+    PYAUTOGUI_IMPORT_ERROR = exc
 
 try:
     from ctypes import cast, POINTER
@@ -47,14 +75,18 @@ except Exception:
 
 try:
     import sounddevice as sd
-except Exception:
+    SOUNDDEVICE_IMPORT_ERROR = None
+except Exception as exc:
     sd = None
+    SOUNDDEVICE_IMPORT_ERROR = exc
 
 try:
     from vosk import Model as VoskModel, KaldiRecognizer
-except Exception:
+    VOSK_IMPORT_ERROR = None
+except Exception as exc:
     VoskModel = None
     KaldiRecognizer = None
+    VOSK_IMPORT_ERROR = exc
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
@@ -67,7 +99,7 @@ class SpeechDictationController:
     def __init__(self, sample_rate=16000, language="en"):
         self.sample_rate = sample_rate
         self.language = language
-        self._model_path = os.path.join(get_base_path(), "vosk-model-small-en-us")
+        self._model_path = resource_path("vosk-model-small-en-us")
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -82,15 +114,32 @@ class SpeechDictationController:
         self._input_device_index = None
         self._input_device_name = "Unavailable"
         self._available = (sd is not None and VoskModel is not None and pyautogui is not None)
-        if self._available:
-            if not os.path.isdir(self._model_path):
+        if not self._available:
+            missing_parts = []
+            if sd is None:
+                message = "sounddevice import failed"
+                if SOUNDDEVICE_IMPORT_ERROR is not None:
+                    message = f"{message}: {SOUNDDEVICE_IMPORT_ERROR}"
+                missing_parts.append(message)
+            if VoskModel is None:
+                message = "vosk import failed"
+                if VOSK_IMPORT_ERROR is not None:
+                    message = f"{message}: {VOSK_IMPORT_ERROR}"
+                missing_parts.append(message)
+            if pyautogui is None:
+                message = "pyautogui import failed"
+                if PYAUTOGUI_IMPORT_ERROR is not None:
+                    message = f"{message}: {PYAUTOGUI_IMPORT_ERROR}"
+                missing_parts.append(message)
+            self._last_error = "; ".join(missing_parts)
+        elif not os.path.isdir(self._model_path):
+            self._available = False
+            self._last_error = f"Speech model not found at {self._model_path}"
+        else:
+            self._input_device_index, self._input_device_name = self._resolve_input_device()
+            if self._input_device_index is None:
                 self._available = False
-                self._last_error = "Speech model not found"
-            else:
-                self._input_device_index, self._input_device_name = self._resolve_input_device()
-                if self._input_device_index is None:
-                    self._available = False
-                    self._last_error = "No input microphone found"
+                self._last_error = "No input microphone found"
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
