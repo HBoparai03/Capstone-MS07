@@ -44,9 +44,289 @@ try:
 except Exception:
     VOLUME_CONTROL_AVAILABLE = False
 
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
+
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    WhisperModel = None
+
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
+
+
+class SpeechDictationController:
+    """Persistent background speech-to-text worker controlled by gestures or tray actions."""
+
+    def __init__(self, model_name="small", sample_rate=16000, chunk_seconds=3.5, language="en"):
+        self.model_name = model_name
+        self.sample_rate = sample_rate
+        self.chunk_frames = int(sample_rate * chunk_seconds)
+        self.language = language
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._thread = None
+        self._model = None
+        self._model_loading = False
+        self._speech_enabled = False
+        self._show_transcript = True
+        self._last_transcript = ""
+        self._last_typed_text = ""
+        self._last_error = ""
+        self._input_device_index = None
+        self._input_device_name = "Unavailable"
+        self._available = (sd is not None and WhisperModel is not None and pyautogui is not None)
+        if self._available:
+            self._input_device_index, self._input_device_name = self._resolve_input_device()
+            if self._input_device_index is None:
+                self._available = False
+                self._last_error = "No input microphone found"
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._speech_worker, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._wake_event.set()
+        if sd is not None:
+            try:
+                sd.stop()
+            except Exception:
+                pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def is_available(self):
+        with self._lock:
+            return self._available
+
+    def set_enabled(self, enabled):
+        enabled = bool(enabled)
+        with self._lock:
+            if not self._available:
+                return False
+            changed = self._speech_enabled != enabled
+            self._speech_enabled = enabled
+            if enabled:
+                self._last_typed_text = ""
+            else:
+                self._model_loading = False
+        if not enabled and sd is not None:
+            try:
+                sd.stop()
+            except Exception:
+                pass
+        self._wake_event.set()
+        return changed
+
+    def toggle_enabled(self):
+        with self._lock:
+            enabled = not self._speech_enabled
+        return self.set_enabled(enabled)
+
+    def set_show_transcript(self, show_transcript):
+        with self._lock:
+            self._show_transcript = bool(show_transcript)
+
+    def toggle_transcript(self):
+        with self._lock:
+            self._show_transcript = not self._show_transcript
+            return self._show_transcript
+
+    def get_snapshot(self):
+        with self._lock:
+            available = self._available
+            enabled = self._speech_enabled
+            show_transcript = self._show_transcript
+            transcript = self._last_transcript
+            last_error = self._last_error
+            model_loading = self._model_loading
+            input_device_name = self._input_device_name
+        if not available:
+            status = "Speech: Unavailable"
+        elif model_loading:
+            status = "Speech: Loading..."
+        else:
+            status = f"Speech: {'ON' if enabled else 'OFF'}"
+        if last_error:
+            status = f"{status} ({last_error})"
+        return {
+            "available": available,
+            "enabled": enabled,
+            "show_transcript": show_transcript,
+            "transcript": transcript,
+            "status": status,
+            "input_device_name": input_device_name,
+        }
+
+    def _set_runtime_error(self, exc):
+        message = exc.__class__.__name__
+        details = str(exc).strip()
+        if details:
+            message = f"{message}: {details}"
+        with self._lock:
+            self._last_error = message
+        print(f"[speech] {message}", file=sys.stderr)
+
+    def _resolve_input_device(self):
+        try:
+            default_device = sd.default.device
+            input_index = None
+            if isinstance(default_device, (list, tuple)) and len(default_device) >= 1:
+                input_index = default_device[0]
+            elif isinstance(default_device, int):
+                input_index = default_device
+
+            if input_index is not None and input_index >= 0:
+                device_info = sd.query_devices(input_index, "input")
+                return input_index, device_info["name"]
+
+            for index, device in enumerate(sd.query_devices()):
+                if device.get("max_input_channels", 0) > 0:
+                    return index, device["name"]
+        except Exception as exc:
+            self._set_runtime_error(exc)
+        return None, "Unavailable"
+
+    def _load_model(self):
+        with self._lock:
+            if self._model is not None:
+                return self._model
+            self._model_loading = True
+            self._last_error = ""
+        model = None
+        load_error = None
+        load_attempts = (
+            {"device": "cpu", "compute_type": "int8"},
+            {"device": "cpu", "compute_type": "float32"},
+        )
+        for attempt in load_attempts:
+            try:
+                model = WhisperModel(
+                    self.model_name,
+                    device=attempt["device"],
+                    compute_type=attempt["compute_type"],
+                )
+                break
+            except Exception as exc:
+                load_error = exc
+        if model is None:
+            with self._lock:
+                self._available = False
+                self._model_loading = False
+                self._speech_enabled = False
+                self._last_error = f"{load_error.__class__.__name__}: {load_error}"
+            print(f"[speech] {load_error.__class__.__name__}: {load_error}", file=sys.stderr)
+            return None
+        with self._lock:
+            self._model = model
+            self._model_loading = False
+        return model
+
+    def _speech_worker(self):
+        silence_threshold = 0.01
+
+        while not self._stop_event.is_set():
+            with self._lock:
+                available = self._available
+                enabled = self._speech_enabled
+
+            if not available:
+                self._wake_event.wait(0.25)
+                self._wake_event.clear()
+                continue
+
+            if not enabled:
+                self._wake_event.wait(0.1)
+                self._wake_event.clear()
+                continue
+
+            model = self._model if self._model is not None else self._load_model()
+            if model is None:
+                self._wake_event.wait(0.25)
+                self._wake_event.clear()
+                continue
+
+            try:
+                audio = sd.rec(
+                    self.chunk_frames,
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    device=self._input_device_index,
+                )
+                sd.wait()
+            except Exception as exc:
+                self._set_runtime_error(exc)
+                self._wake_event.wait(0.25)
+                self._wake_event.clear()
+                continue
+
+            if self._stop_event.is_set():
+                break
+
+            with self._lock:
+                enabled = self._speech_enabled
+                self._last_error = ""
+
+            if not enabled:
+                continue
+
+            audio = np.squeeze(audio)
+            if audio.size == 0 or float(np.max(np.abs(audio))) < silence_threshold:
+                continue
+
+            try:
+                segments, _ = model.transcribe(
+                    audio,
+                    language=self.language,
+                    beam_size=5,
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                )
+                text = " ".join(segment.text.strip() for segment in segments).strip()
+            except Exception as exc:
+                self._set_runtime_error(exc)
+                continue
+
+            normalized_text = " ".join(text.split())
+            if not normalized_text:
+                continue
+
+            with self._lock:
+                self._last_transcript = normalized_text
+                if normalized_text == self._last_typed_text:
+                    continue
+
+            try:
+                pyautogui.write(normalized_text + " ", interval=0.0)
+            except Exception as exc:
+                self._set_runtime_error(exc)
+                continue
+
+            with self._lock:
+                self._last_typed_text = normalized_text
+
+
+def handle_speech_gesture(hand_sign_id, hand_sign_label, now, open_label_index, close_label_index,
+                          speech_controller, can_activate_gesture):
+    """Use Open to enable dictation and Close to disable it, reusing gesture hold/cooldown logic."""
+    if speech_controller is None or not speech_controller.is_available():
+        return
+    if open_label_index is not None and hand_sign_id == open_label_index:
+        if can_activate_gesture(hand_sign_label, now):
+            speech_controller.set_enabled(True)
+    elif close_label_index is not None and hand_sign_id == close_label_index:
+        if can_activate_gesture(hand_sign_label, now):
+            speech_controller.set_enabled(False)
 
 
 def get_args():
@@ -124,6 +404,10 @@ def get_args():
                         help='Cooldown in seconds between re-triggering the same gesture',
                         type=float,
                         default=1.5)
+    parser.add_argument("--pinch_click_delay",
+                        help='Seconds to hold a pinch before triggering a click',
+                        type=float,
+                        default=1.5)
 
     args = parser.parse_args()
 
@@ -136,6 +420,9 @@ def main_new_ui(args):
     from PyQt5.QtCore import QTimer, Qt
     from Overlay import OverlayWindow
     from Tray import TrayIcon
+
+    speech_controller = SpeechDictationController()
+    speech_controller.start()
     
     # Initialize MediaPipe and classifiers
     mp_hands = mp.solutions.hands
@@ -224,25 +511,28 @@ def main_new_ui(args):
     # Debounce for pinch clicks
     last_pinch_click_time = [0.0]
     pinch_click_cooldown_sec = 1.0
+    pinch_click_delay_sec = args.pinch_click_delay
     # Gesture hold time tracking
     first_detected_time = {}  # When each gesture was first detected
     last_activated_time = {}  # When each gesture was last activated
     gesture_hold_time_sec = args.gesture_hold_time
     gesture_cooldown_sec = args.gesture_cooldown
 
-    def can_activate_gesture(label, now):
+    def can_activate_gesture(label, now, hold_time_sec=None, cooldown_sec=None):
+        hold_time_sec = gesture_hold_time_sec if hold_time_sec is None else hold_time_sec
+        cooldown_sec = gesture_cooldown_sec if cooldown_sec is None else cooldown_sec
         # Check if gesture has been held long enough
         if label not in first_detected_time:
             first_detected_time[label] = now
             return False
         
         hold_duration = now - first_detected_time[label]
-        if hold_duration < gesture_hold_time_sec:
+        if hold_duration < hold_time_sec:
             return False
         
         # Check cooldown after activation
         last_activated = last_activated_time.get(label, 0.0)
-        if now - last_activated < gesture_cooldown_sec:
+        if now - last_activated < cooldown_sec:
             return False
         
         last_activated_time[label] = now
@@ -258,9 +548,15 @@ def main_new_ui(args):
     
     # Create the overlay window
     overlay = OverlayWindow()
+    overlay.set_speech_controller(speech_controller)
     
     # Create the tray icon (owns gesture_hand / mouse_enabled state)
-    tray = TrayIcon(overlay, gesture_hand=args.gesturehand.capitalize(), mouse_enabled=True)
+    tray = TrayIcon(
+        overlay,
+        gesture_hand=args.gesturehand.capitalize(),
+        mouse_enabled=True,
+        speech_controller=speech_controller,
+    )
     
     # Store gesture state for the overlay
     current_gesture = ["Gesture: (awaiting detection...)"]
@@ -362,7 +658,12 @@ def main_new_ui(args):
 
                     if pyautogui is not None and is_gesture_hand and is_pinch_gesture:
                         now = time.time()
-                        if now - last_pinch_click_time[0] >= pinch_click_cooldown_sec:
+                        if can_activate_gesture(
+                            hand_sign_label,
+                            now,
+                            hold_time_sec=pinch_click_delay_sec,
+                            cooldown_sec=pinch_click_cooldown_sec,
+                        ) and now - last_pinch_click_time[0] >= pinch_click_cooldown_sec:
                             try:
                                 pyautogui.click()
                                 last_pinch_click_time[0] = now
@@ -371,7 +672,27 @@ def main_new_ui(args):
 
                     if pyautogui is not None and is_gesture_hand:
                         now = time.time()
-                        if ok_label_index is not None and hand_sign_id == ok_label_index:
+                        if open_label_index is not None and hand_sign_id == open_label_index:
+                            handle_speech_gesture(
+                                hand_sign_id,
+                                hand_sign_label,
+                                now,
+                                open_label_index,
+                                close_label_index,
+                                speech_controller,
+                                can_activate_gesture,
+                            )
+                        elif close_label_index is not None and hand_sign_id == close_label_index:
+                            handle_speech_gesture(
+                                hand_sign_id,
+                                hand_sign_label,
+                                now,
+                                open_label_index,
+                                close_label_index,
+                                speech_controller,
+                                can_activate_gesture,
+                            )
+                        elif ok_label_index is not None and hand_sign_id == ok_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
                                     pyautogui.hotkey('ctrl', 't')
@@ -463,6 +784,10 @@ def main_new_ui(args):
                 processing_thread.join(timeout=1.0)
         except Exception:
             pass
+        try:
+            speech_controller.stop()
+        except Exception:
+            pass
         close_method = getattr(hands, 'close', None)
         if callable(close_method):
             try:
@@ -484,6 +809,9 @@ def main_new_ui(args):
 
 def main_old_ui(args):
     """Run the original OpenCV window UI with gesture recognition."""
+    speech_controller = SpeechDictationController()
+    speech_controller.start()
+
     cap_device = args.device
     cap_width = args.width
     cap_height = args.height
@@ -616,6 +944,7 @@ def main_old_ui(args):
     # Debounce for pinch clicks
     last_pinch_click_time = 0.0
     pinch_click_cooldown_sec = 1.0
+    pinch_click_delay_sec = args.pinch_click_delay
 
     # Gesture hold time tracking
     first_detected_time = {}  # When each gesture was first detected
@@ -623,19 +952,21 @@ def main_old_ui(args):
     gesture_hold_time_sec = args.gesture_hold_time
     gesture_cooldown_sec = args.gesture_cooldown
 
-    def can_activate_gesture(label, now):
+    def can_activate_gesture(label, now, hold_time_sec=None, cooldown_sec=None):
+        hold_time_sec = gesture_hold_time_sec if hold_time_sec is None else hold_time_sec
+        cooldown_sec = gesture_cooldown_sec if cooldown_sec is None else cooldown_sec
         # Check if gesture has been held long enough
         if label not in first_detected_time:
             first_detected_time[label] = now
             return False
         
         hold_duration = now - first_detected_time[label]
-        if hold_duration < gesture_hold_time_sec:
+        if hold_duration < hold_time_sec:
             return False
         
         # Check cooldown after activation
         last_activated = last_activated_time.get(label, 0.0)
-        if now - last_activated < gesture_cooldown_sec:
+        if now - last_activated < cooldown_sec:
             return False
         
         last_activated_time[label] = now
@@ -836,10 +1167,15 @@ def main_old_ui(args):
                     # Reset previous mouse position when not in pointer (move) mode
                     prev_mouse_pos = None
 
-                # Pinch on gesture hand = left click (with 1-second debounce)
+                # Pinch on gesture hand = left click after a short hold
                 if mode == 0 and pyautogui is not None and is_gesture_hand and is_pinch_gesture:
                     now = time.time()
-                    if now - last_pinch_click_time >= pinch_click_cooldown_sec:
+                    if can_activate_gesture(
+                        hand_sign_label,
+                        now,
+                        hold_time_sec=pinch_click_delay_sec,
+                        cooldown_sec=pinch_click_cooldown_sec,
+                    ) and now - last_pinch_click_time >= pinch_click_cooldown_sec:
                         try:
                             pyautogui.click()
                             last_pinch_click_time = now
@@ -852,8 +1188,32 @@ def main_old_ui(args):
                 # - Requires pyautogui to be available
                 if mode == 0 and pyautogui is not None and is_gesture_hand:
                     now = time.time()
+                    # Open hand -> enable speech dictation
+                    if (open_label_index is not None and
+                            hand_sign_id == open_label_index):
+                        handle_speech_gesture(
+                            hand_sign_id,
+                            hand_sign_label,
+                            now,
+                            open_label_index,
+                            close_label_index,
+                            speech_controller,
+                            can_activate_gesture,
+                        )
+                    # Close hand -> disable speech dictation
+                    elif (close_label_index is not None and
+                            hand_sign_id == close_label_index):
+                        handle_speech_gesture(
+                            hand_sign_id,
+                            hand_sign_label,
+                            now,
+                            open_label_index,
+                            close_label_index,
+                            speech_controller,
+                            can_activate_gesture,
+                        )
                     # OK sign -> Ctrl+T (new tab)
-                    if (ok_label_index is not None and
+                    elif (ok_label_index is not None and
                             hand_sign_id == ok_label_index):
                         if can_activate_gesture(hand_sign_label, now):
                             try:
@@ -958,6 +1318,8 @@ def main_old_ui(args):
         except queue.Full:
             pass
         mouse_thread.join(timeout=1.5)
+
+    speech_controller.stop()
 
     cap.release()
     cv.destroyAllWindows()

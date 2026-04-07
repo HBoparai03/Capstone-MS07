@@ -34,6 +34,7 @@ class OverlayWindow(QWidget):
         self._app_driven = False
         self._last_frame = None
         self._last_gesture_label = None
+        self._speech_controller = None
 
         # --- Window Setup ---
         self.setWindowTitle("Gesture Overlay")
@@ -65,7 +66,7 @@ class OverlayWindow(QWidget):
         # --- Gesture instruction table ---
         self.gesture_table = QTableWidget(self)
         self.gesture_table.setColumnCount(3)
-        self.gesture_table.setRowCount(7)
+        self.gesture_table.setRowCount(9)
         self.gesture_table.setHorizontalHeaderLabels(["Gesture", "Action", "Description"])
         self.gesture_table.verticalHeader().setVisible(False)
         self.gesture_table.horizontalHeader().setStretchLastSection(True)
@@ -107,6 +108,8 @@ class OverlayWindow(QWidget):
 
         # Placeholder rows
         placeholders = [
+            ("Open Hand", "Enable speech dictation", "Starts microphone listening and Whisper dictation"),
+            ("Closed Fist", "Disable speech dictation", "Stops microphone listening"),
             ("OK Sign", "Open a new browser tab (Ctrl + T)", ""),
             ("Four Fingers Up", "Close the current tab. (Ctrl + W)", ""),
             ("Thumbs Up", "Volume Up (system control)", ""),
@@ -123,13 +126,13 @@ class OverlayWindow(QWidget):
                 item.setFlags(item.flags() ^ Qt.ItemIsEditable)
                 self.gesture_table.setItem(row, col, item)
 
-        self.add_image_to_cell(0, 2, resource_path("icons/Ok.png"))
-        self.add_image_to_cell(1, 2, resource_path("icons/fourfu.png"))
-        self.add_image_to_cell(2, 2, resource_path("icons/tup.png"))
-        self.add_image_to_cell(3, 2, resource_path("icons/tdown.png"))
-        self.add_image_to_cell(4, 2, resource_path("icons/twofu.png"))
-        self.add_image_to_cell(5, 2, resource_path("icons/threefu.png"))
-        self.add_image_to_cell(6, 2, resource_path("icons/pinch.png"))
+        self.add_image_to_cell(2, 2, resource_path("icons/Ok.png"))
+        self.add_image_to_cell(3, 2, resource_path("icons/fourfu.png"))
+        self.add_image_to_cell(4, 2, resource_path("icons/tup.png"))
+        self.add_image_to_cell(5, 2, resource_path("icons/tdown.png"))
+        self.add_image_to_cell(6, 2, resource_path("icons/twofu.png"))
+        self.add_image_to_cell(7, 2, resource_path("icons/threefu.png"))
+        self.add_image_to_cell(8, 2, resource_path("icons/pinch.png"))
 
         # Resize rows/columns to fit content
         self.gesture_table.resizeColumnsToContents()
@@ -152,6 +155,32 @@ class OverlayWindow(QWidget):
             }
         """)
         self.layout.addStretch()
+
+        self.speech_status_label = QLabel("Speech: OFF")
+        self.speech_status_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 18px;
+                background-color: rgba(0, 0, 0, 128);
+                border-radius: 10px;
+                padding: 6px 14px;
+            }
+        """)
+        self.layout.addWidget(self.speech_status_label, alignment=Qt.AlignBottom | Qt.AlignHCenter)
+
+        self.transcript_label = QLabel("Transcript: ")
+        self.transcript_label.setWordWrap(True)
+        self.transcript_label.setMaximumWidth(700)
+        self.transcript_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 16px;
+                background-color: rgba(0, 0, 0, 128);
+                border-radius: 10px;
+                padding: 6px 14px;
+            }
+        """)
+        self.layout.addWidget(self.transcript_label, alignment=Qt.AlignBottom | Qt.AlignHCenter)
         self.layout.addWidget(self.gesture_label, alignment=Qt.AlignBottom | Qt.AlignHCenter)
 
         # --- Timer for frames ---
@@ -211,6 +240,9 @@ class OverlayWindow(QWidget):
         """Set the gesture label (used when app_driven)."""
         self._last_gesture_label = text
 
+    def set_speech_controller(self, controller):
+        self._speech_controller = controller
+
     # ----------------------------
     # Toggle overlay/table
     # ----------------------------
@@ -253,6 +285,12 @@ class OverlayWindow(QWidget):
             )
         if text is not None:
             self.gesture_label.setText(text)
+        if self._speech_controller is not None:
+            snapshot = self._speech_controller.get_snapshot()
+            self.speech_status_label.setText(snapshot["status"])
+            transcript = snapshot["transcript"] if snapshot["transcript"] else "(awaiting speech)"
+            self.transcript_label.setText(f"Transcript: {transcript}")
+            self.transcript_label.setVisible(snapshot["show_transcript"])
 
     # ----------------------------
     # Paint translucent overlay

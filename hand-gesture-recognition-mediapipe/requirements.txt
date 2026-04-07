@@ -1,5 +1,7 @@
-mediapipe==0.10.32
+mediapipe==0.10.21
 numpy==1.26.4
 opencv-python==4.8.1.78
 PyAutoGUI==0.9.54
+faster-whisper
+sounddevice
 tensorflow==2.15.0

@@ -2,7 +2,7 @@
 # Build: pyinstaller hand_gesture_app.spec
 
 import os
-import mediapipe
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 block_cipher = None
 
@@ -11,14 +11,18 @@ model_root = 'model'
 keypoint_dir = os.path.join(model_root, 'keypoint_classifier')
 point_history_dir = os.path.join(model_root, 'point_history_classifier')
 
-mp_root = os.path.dirname(mediapipe.__file__)
+ctranslate2_binaries = collect_dynamic_libs('ctranslate2')
+mediapipe_binaries = collect_dynamic_libs('mediapipe')
+mediapipe_datas = collect_data_files('mediapipe')
+faster_whisper_hiddenimports = collect_submodules('faster_whisper')
+av_hiddenimports = collect_submodules('av')
+sounddevice_datas = collect_data_files('_sounddevice_data')
 
 datas = [
     (os.path.join(keypoint_dir, 'keypoint_classifier.tflite'), keypoint_dir),
     (os.path.join(keypoint_dir, 'keypoint_classifier_label.csv'), keypoint_dir),
     (os.path.join(point_history_dir, 'point_history_classifier.tflite'), point_history_dir),
     (os.path.join(point_history_dir, 'point_history_classifier_label.csv'), point_history_dir),
-    (os.path.join(mp_root, 'modules'), 'mediapipe/modules'),
     ('icon.ico', '.'),
     ('icons/Ok.png', 'icons'),
     ('icons/fourfu.png', 'icons'),
@@ -27,7 +31,7 @@ datas = [
     ('icons/threefu.png', 'icons'),
     ('icons/tup.png', 'icons'),
     ('icons/twofu.png', 'icons'),
-]
+] + mediapipe_datas + sounddevice_datas
 
 # Hidden imports often needed by TensorFlow, OpenCV, PyQt5, pystray
 hiddenimports = [
@@ -35,15 +39,17 @@ hiddenimports = [
     'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets',
     'pystray', 'PIL', 'PIL._tkinter_finder',
     'pyautogui', 'comtypes', 'pycaw',
+    'sounddevice', '_sounddevice', '_sounddevice_data',
+    'faster_whisper', 'ctranslate2', 'av',
     'mediapipe.python._framework_bindings',
     'mediapipe.python._framework_bindings.calculator_graph',
     'mediapipe.python._framework_bindings.packet',
-]
+] + faster_whisper_hiddenimports + av_hiddenimports
 
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=[],
+    binaries=ctranslate2_binaries + mediapipe_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
