@@ -3,7 +3,7 @@
 
 import os
 import mediapipe
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_dynamic_libs  # ✅ ADD
 
 block_cipher = None
 
@@ -14,12 +14,11 @@ point_history_dir = os.path.join(model_root, 'point_history_classifier')
 
 mp_root = os.path.dirname(mediapipe.__file__)
 
-vosk_hiddenimports = collect_submodules('vosk')
-sounddevice_datas = collect_data_files('_sounddevice_data')
+# ✅ ADD (MediaPipe DLL fix)
+mp_binaries = collect_dynamic_libs('mediapipe')
 
-# Bundle the vosk model folder if it has been downloaded
-_vosk_model_src = 'vosk-model-small-en-us'
-_vosk_model_datas = [(_vosk_model_src, _vosk_model_src)] if os.path.isdir(_vosk_model_src) else []
+# ✅ OPTIONAL (Vosk model)
+vosk_model_path = 'vosk-model-small-en-us'
 
 datas = [
     (os.path.join(keypoint_dir, 'keypoint_classifier.tflite'), keypoint_dir),
@@ -35,7 +34,11 @@ datas = [
     ('icons/threefu.png', 'icons'),
     ('icons/tup.png', 'icons'),
     ('icons/twofu.png', 'icons'),
-] + sounddevice_datas + _vosk_model_datas
+]
+
+# ✅ Add Vosk model ONLY if exists
+if os.path.isdir(vosk_model_path):
+    datas.append((vosk_model_path, vosk_model_path))
 
 # Hidden imports often needed by TensorFlow, OpenCV, PyQt5, pystray
 hiddenimports = [
@@ -43,17 +46,20 @@ hiddenimports = [
     'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets',
     'pystray', 'PIL', 'PIL._tkinter_finder',
     'pyautogui', 'comtypes', 'pycaw',
-    'sounddevice', '_sounddevice', '_sounddevice_data',
-    'vosk', 'cffi',
+
+    # ✅ ONLY correct MediaPipe binding
     'mediapipe.python._framework_bindings',
-    'mediapipe.python._framework_bindings.calculator_graph',
-    'mediapipe.python._framework_bindings.packet',
-] + vosk_hiddenimports
+
+    # ✅ Minimal Vosk
+    'vosk',
+    'sounddevice',
+    '_sounddevice',
+]
 
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=[],
+    binaries=mp_binaries,  # ✅ FIX HERE
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -82,7 +88,10 @@ exe = EXE(
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # No console window for GUI app
+
+    # 🔥 KEEP TRUE until stable
+    console=True,
+
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
