@@ -1,82 +1,65 @@
 # Speech-to-Text Setup
 
-The speech dictation feature uses [Vosk](https://alphacephei.com/vosk/) for fully offline, local speech recognition.
-The small English model is ~50 MB and works without internet after initial setup.
+The speech dictation feature uses [Vosk](https://alphacephei.com/vosk/) for fully offline, local speech recognition (~50 MB model, no internet after setup).
 
 ---
 
-## Step 1 — Download the Vosk model
+## Quick Start
 
-Download the small English model and extract it so the folder is named exactly `vosk-model-small-en-us` in the same directory as `app.py`:
+```
+pip install -r requirements.txt
+python download_vosk_model.py
+python app.py
+```
+
+That's it. The download script handles everything.
+
+---
+
+## What `download_vosk_model.py` does
+
+- Downloads `vosk-model-small-en-us-0.15` (~50 MB) from the official Vosk site
+- Extracts and places it as `vosk-model-small-en-us/` next to `app.py`
+- Safe to re-run — skips download if the folder already exists
 
 ```
 hand-gesture-recognition-mediapipe/
     app.py
-    vosk-model-small-en-us/       <-- place it here
-        am/
-        conf/
-        graph/
-        ...
+    download_vosk_model.py
+    vosk-model-small-en-us/        <-- created by the script
 ```
 
-Download link: https://alphacephei.com/vosk/models
-Model to use: **vosk-model-small-en-us-0.15** (or latest small English model)
+The model folder is in `.gitignore` — each developer runs the script once.
 
 ---
 
-## Step 2 — Install dependencies
+## Building the EXE
+
+Run the download script **before** building. The spec auto-detects the model folder and bundles it.
 
 ```
-pip install vosk sounddevice pyautogui
-```
-
----
-
-## Running as a Python Script
-
-```
-python app.py
-```
-
-Speech activates via gesture. The model loads from `vosk-model-small-en-us/` next to `app.py`.
-
----
-
-## Building and Running the EXE
-
-### Build
-
-Place the `vosk-model-small-en-us/` folder next to `app.py` **before** building.
-The spec automatically detects and bundles it:
-
-```
+python download_vosk_model.py
 pyinstaller hand_gesture_app.spec
 ```
 
-The model is bundled inside `dist/HandGestureRecognition/` — no internet required on the end user's machine.
-
-### Run
-
-```
-dist/HandGestureRecognition/HandGestureRecognition.exe
-```
+The built EXE in `dist/HandGestureRecognition/` is fully self-contained — no internet required on the end user's machine.
 
 ---
 
 ## What happens if the model folder is missing
 
-The app launches normally and gesture recognition works. Speech mode will show:
+The app launches normally, gesture recognition works. Speech mode shows:
 
 ```
 Speech: Unavailable (Speech model not found)
 ```
 
-No crash. Add the model folder and relaunch to enable speech.
+No crash. Run `python download_vosk_model.py` and relaunch.
 
 ---
 
 ## Notes
 
-- The `vosk-model-small-en-us/` folder is excluded from git (too large). Each developer downloads it once.
-- Vosk runs fully offline — no HuggingFace downloads, no internet dependency.
-- Accuracy is lower than Whisper but sufficient for short dictation commands.
+- Vosk runs fully offline after the one-time download
+- The model folder is excluded from git — run the script once per machine
+- Accuracy is lower than Whisper but sufficient for short dictation phrases
