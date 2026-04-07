@@ -11,12 +11,14 @@ model_root = 'model'
 keypoint_dir = os.path.join(model_root, 'keypoint_classifier')
 point_history_dir = os.path.join(model_root, 'point_history_classifier')
 
-ctranslate2_binaries = collect_dynamic_libs('ctranslate2')
 mediapipe_binaries = collect_dynamic_libs('mediapipe')
 mediapipe_datas = collect_data_files('mediapipe')
-faster_whisper_hiddenimports = collect_submodules('faster_whisper')
-av_hiddenimports = collect_submodules('av')
+vosk_hiddenimports = collect_submodules('vosk')
 sounddevice_datas = collect_data_files('_sounddevice_data')
+
+# Bundle the vosk model folder if it has been downloaded
+_vosk_model_src = 'vosk-model-small-en-us'
+_vosk_model_datas = [(_vosk_model_src, _vosk_model_src)] if os.path.isdir(_vosk_model_src) else []
 
 datas = [
     (os.path.join(keypoint_dir, 'keypoint_classifier.tflite'), keypoint_dir),
@@ -31,7 +33,7 @@ datas = [
     ('icons/threefu.png', 'icons'),
     ('icons/tup.png', 'icons'),
     ('icons/twofu.png', 'icons'),
-] + mediapipe_datas + sounddevice_datas
+] + mediapipe_datas + sounddevice_datas + _vosk_model_datas
 
 # Hidden imports often needed by TensorFlow, OpenCV, PyQt5, pystray
 hiddenimports = [
@@ -40,16 +42,16 @@ hiddenimports = [
     'pystray', 'PIL', 'PIL._tkinter_finder',
     'pyautogui', 'comtypes', 'pycaw',
     'sounddevice', '_sounddevice', '_sounddevice_data',
-    'faster_whisper', 'ctranslate2', 'av', 'huggingface_hub',
+    'vosk', 'cffi',
     'mediapipe.python._framework_bindings',
     'mediapipe.python._framework_bindings.calculator_graph',
     'mediapipe.python._framework_bindings.packet',
-] + faster_whisper_hiddenimports + av_hiddenimports
+] + vosk_hiddenimports
 
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=ctranslate2_binaries + mediapipe_binaries,
+    binaries=mediapipe_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
