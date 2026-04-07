@@ -89,6 +89,7 @@ python app.py --no_high_performance --draw_quality low --mouse_update_rate 30 --
 - `--draw_quality medium`
 - `--mouse_update_rate 120`
 - `--min_mouse_movement 2`
+- `--pinch_click_delay 1.5`
 
 ---
 
