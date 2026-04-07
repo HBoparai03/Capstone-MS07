@@ -2,7 +2,8 @@
 # Build: pyinstaller hand_gesture_app.spec
 
 import os
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
+import mediapipe
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
@@ -11,8 +12,8 @@ model_root = 'model'
 keypoint_dir = os.path.join(model_root, 'keypoint_classifier')
 point_history_dir = os.path.join(model_root, 'point_history_classifier')
 
-mediapipe_binaries = collect_dynamic_libs('mediapipe')
-mediapipe_datas = collect_data_files('mediapipe')
+mp_root = os.path.dirname(mediapipe.__file__)
+
 vosk_hiddenimports = collect_submodules('vosk')
 sounddevice_datas = collect_data_files('_sounddevice_data')
 
@@ -25,6 +26,7 @@ datas = [
     (os.path.join(keypoint_dir, 'keypoint_classifier_label.csv'), keypoint_dir),
     (os.path.join(point_history_dir, 'point_history_classifier.tflite'), point_history_dir),
     (os.path.join(point_history_dir, 'point_history_classifier_label.csv'), point_history_dir),
+    (os.path.join(mp_root, 'modules'), 'mediapipe/modules'),
     ('icon.ico', '.'),
     ('icons/Ok.png', 'icons'),
     ('icons/fourfu.png', 'icons'),
@@ -33,7 +35,7 @@ datas = [
     ('icons/threefu.png', 'icons'),
     ('icons/tup.png', 'icons'),
     ('icons/twofu.png', 'icons'),
-] + mediapipe_datas + sounddevice_datas + _vosk_model_datas
+] + sounddevice_datas + _vosk_model_datas
 
 # Hidden imports often needed by TensorFlow, OpenCV, PyQt5, pystray
 hiddenimports = [
@@ -51,7 +53,7 @@ hiddenimports = [
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=mediapipe_binaries,
+    binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
