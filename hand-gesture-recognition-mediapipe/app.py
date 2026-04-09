@@ -6,6 +6,9 @@ import argparse
 import itertools
 import os
 import sys
+import atexit
+import faulthandler
+import logging
 from collections import Counter
 from collections import deque
 
@@ -13,16 +16,127 @@ if hasattr(sys, "_MEIPASS"):
     os.environ["MEDIAPIPE_RESOURCE_PATH"] = sys._MEIPASS
 
 
+def _candidate_base_paths():
+    candidates = []
+
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(sys._MEIPASS)
+
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(exe_dir)
+        candidates.append(os.path.join(exe_dir, "_internal"))
+
+    candidates.append(os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(os.path.abspath("."))
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_candidates.append(candidate)
+
+    return unique_candidates
+
+
 def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+    for base_path in _candidate_base_paths():
+        candidate = os.path.join(base_path, relative_path)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(_candidate_base_paths()[0], relative_path)
 
 def get_base_path():
     """Return base path for resources (works when run as script or as PyInstaller exe)."""
-    if getattr(sys, 'frozen', False):
-        return sys._MEIPASS
-    return os.path.dirname(os.path.abspath(__file__))
+    return _candidate_base_paths()[0]
+
+
+class _LoggerWriter:
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+
+    def write(self, message):
+        if not message:
+            return
+        for line in message.rstrip().splitlines():
+            line = line.strip()
+            if line:
+                self.logger.log(self.level, line)
+
+    def flush(self):
+        for handler in self.logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
+
+
+_FAULT_LOG_HANDLE = None
+APP_LOG_PATH = None
+
+
+def _get_log_path():
+    if getattr(sys, "frozen", False):
+        log_root = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "HandGestureApp", "logs")
+    else:
+        log_root = os.path.join(get_base_path(), "logs")
+    os.makedirs(log_root, exist_ok=True)
+    return os.path.join(log_root, "hand_gesture_app.log")
+
+
+def setup_runtime_logging():
+    global _FAULT_LOG_HANDLE, APP_LOG_PATH
+
+    APP_LOG_PATH = _get_log_path()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.FileHandler(APP_LOG_PATH, encoding="utf-8")],
+        force=True,
+    )
+
+    app_logger = logging.getLogger("handgesture")
+    app_logger.info("=== Application start ===")
+    app_logger.info("Frozen=%s", getattr(sys, "frozen", False))
+    app_logger.info("Executable=%s", sys.executable)
+    app_logger.info("Base path=%s", get_base_path())
+    app_logger.info("Log path=%s", APP_LOG_PATH)
+
+    def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
+        logging.getLogger("handgesture.crash").critical(
+            "Unhandled exception",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+
+    sys.excepthook = _log_uncaught_exception
+
+    sys.stdout = _LoggerWriter(logging.getLogger("stdout"), logging.INFO)
+    sys.stderr = _LoggerWriter(logging.getLogger("stderr"), logging.ERROR)
+
+    try:
+        _FAULT_LOG_HANDLE = open(APP_LOG_PATH, "a", encoding="utf-8")
+        faulthandler.enable(_FAULT_LOG_HANDLE, all_threads=True)
+    except Exception:
+        app_logger.exception("Failed to enable faulthandler")
+
+    def _shutdown_logging():
+        logging.getLogger("handgesture").info("=== Application shutdown ===")
+        if _FAULT_LOG_HANDLE is not None:
+            try:
+                _FAULT_LOG_HANDLE.flush()
+                _FAULT_LOG_HANDLE.close()
+            except Exception:
+                pass
+
+    atexit.register(_shutdown_logging)
+
+
+setup_runtime_logging()
 
 import cv2 as cv
 import numpy as np
@@ -30,6 +144,15 @@ import mediapipe as mp
 import time
 import threading
 import queue
+
+if hasattr(threading, "excepthook"):
+    def _threading_excepthook(args):
+        logging.getLogger("handgesture.thread").critical(
+            "Unhandled thread exception in %s",
+            args.thread.name if args.thread is not None else "unknown",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+    threading.excepthook = _threading_excepthook
 
 try:
     import pyautogui  # For sending Ctrl+T to active window and mouse control
@@ -63,6 +186,7 @@ class SpeechDictationController:
     """Persistent background speech-to-text worker controlled by gestures or tray actions."""
 
     def __init__(self, model_name="small", sample_rate=16000, chunk_seconds=3.5, language="en"):
+        self._logger = logging.getLogger("handgesture.speech")
         self.model_name = model_name
         self._model_dir = self._resolve_model_dir(model_name)
         self.sample_rate = sample_rate
@@ -82,16 +206,25 @@ class SpeechDictationController:
         self._input_device_index = None
         self._input_device_name = "Unavailable"
         self._available = (sd is not None and WhisperModel is not None and pyautogui is not None)
+        self._logger.info(
+            "Speech controller initialized: available=%s model_dir=%s sample_rate=%s chunk_frames=%s",
+            self._available,
+            self._model_dir,
+            self.sample_rate,
+            self.chunk_frames,
+        )
         if self._available:
             self._input_device_index, self._input_device_name = self._resolve_input_device()
             if self._input_device_index is None:
                 self._available = False
                 self._last_error = "No input microphone found"
+                self._logger.error(self._last_error)
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
             return
-        self._thread = threading.Thread(target=self._speech_worker, daemon=True)
+        self._thread = threading.Thread(target=self._speech_worker, daemon=True, name="SpeechWorker")
+        self._logger.info("Starting speech worker thread")
         self._thread.start()
 
     def stop(self):
@@ -111,8 +244,10 @@ class SpeechDictationController:
 
     def set_enabled(self, enabled):
         enabled = bool(enabled)
+        self._logger.info("Speech toggle requested: enabled=%s", enabled)
         with self._lock:
             if not self._available:
+                self._logger.warning("Speech toggle ignored because speech is unavailable: %s", self._last_error)
                 return False
             changed = self._speech_enabled != enabled
             self._speech_enabled = enabled
@@ -175,7 +310,7 @@ class SpeechDictationController:
             message = f"{message}: {details}"
         with self._lock:
             self._last_error = message
-        print(f"[speech] {message}", file=sys.stderr)
+        self._logger.exception("Speech runtime error", exc_info=(type(exc), exc, exc.__traceback__))
 
     def _resolve_input_device(self):
         try:
@@ -199,11 +334,20 @@ class SpeechDictationController:
 
     @staticmethod
     def _resolve_model_dir(model_name):
-        """Return the local model directory (EXE) or None (script uses HF cache)."""
+        bundled_model_dir = resource_path(os.path.join("speech_models", f"whisper-{model_name}"))
+        if os.path.isdir(bundled_model_dir):
+            return bundled_model_dir
+
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+        appdata_model_dir = os.path.join(appdata, "HandGestureApp", "models", f"whisper-{model_name}")
+
+        if os.path.isdir(appdata_model_dir):
+            return appdata_model_dir
+
         if not getattr(sys, 'frozen', False):
             return None  # script mode: faster-whisper resolves via HuggingFace cache
-        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-        return os.path.join(appdata, "HandGestureApp", "models", f"whisper-{model_name}")
+
+        return appdata_model_dir
 
     def _is_model_ready(self):
         """Return True if the model is available locally (or we are in script mode)."""
@@ -239,13 +383,18 @@ class SpeechDictationController:
             self._model_loading = True
             self._last_error = ""
 
+        self._logger.info(
+            "Loading Faster-Whisper model from %s",
+            self._model_dir if self._model_dir is not None else self.model_name,
+        )
+
         if not self._is_model_ready():
             with self._lock:
                 self._available = False
                 self._model_loading = False
                 self._speech_enabled = False
-                self._last_error = "Speech model not downloaded"
-            print("[speech] Speech model not downloaded. Call download_model() first.", file=sys.stderr)
+                self._last_error = f"Speech model not found at {self._model_dir}"
+            self._logger.error("Speech model not found at %s", self._model_dir)
             return None
 
         # In EXE mode use the local folder path; in script mode use the model name
@@ -254,16 +403,27 @@ class SpeechDictationController:
 
         model = None
         load_error = None
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("CT2_USE_EXPERIMENTAL_PACKED_GEMM", "0")
         load_attempts = (
-            {"device": "cpu", "compute_type": "int8"},
-            {"device": "cpu", "compute_type": "float32"},
+            {"device": "cpu", "compute_type": "float32", "cpu_threads": 1, "num_workers": 1},
         )
         for attempt in load_attempts:
             try:
+                self._logger.info(
+                    "Whisper load attempt: device=%s compute_type=%s cpu_threads=%s num_workers=%s source=%s",
+                    attempt["device"],
+                    attempt["compute_type"],
+                    attempt["cpu_threads"],
+                    attempt["num_workers"],
+                    model_source,
+                )
                 model = WhisperModel(
                     model_source,
                     device=attempt["device"],
                     compute_type=attempt["compute_type"],
+                    cpu_threads=attempt["cpu_threads"],
+                    num_workers=attempt["num_workers"],
                 )
                 break
             except Exception as exc:
@@ -274,15 +434,20 @@ class SpeechDictationController:
                 self._model_loading = False
                 self._speech_enabled = False
                 self._last_error = f"{load_error.__class__.__name__}: {load_error}"
-            print(f"[speech] {load_error.__class__.__name__}: {load_error}", file=sys.stderr)
+            self._logger.exception(
+                "Whisper model load failed",
+                exc_info=(type(load_error), load_error, load_error.__traceback__),
+            )
             return None
         with self._lock:
             self._model = model
             self._model_loading = False
+        self._logger.info("Whisper model loaded successfully")
         return model
 
     def _speech_worker(self):
         silence_threshold = 0.01
+        self._logger.info("Speech worker loop started")
 
         while not self._stop_event.is_set():
             with self._lock:
@@ -350,6 +515,8 @@ class SpeechDictationController:
             normalized_text = " ".join(text.split())
             if not normalized_text:
                 continue
+
+            self._logger.info("Speech transcript produced: %s", normalized_text)
 
             with self._lock:
                 self._last_transcript = normalized_text

@@ -1,90 +1,56 @@
 # Speech-to-Text Setup
 
-The speech dictation feature uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (Whisper small model, ~244 MB).
+The speech dictation feature uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with the Whisper small model.
 
-When running as a **Python script**, the model is downloaded automatically to the HuggingFace cache on first use — no setup needed.
+When running as a Python script, Faster-Whisper can still use the Hugging Face cache normally.
 
-When running as a **built EXE**, the model must be downloaded separately to a local folder before speech will work. The EXE cannot download it on its own.
+When building the EXE, the Whisper model is bundled from:
+
+`hand-gesture-recognition-mediapipe\whisper-small\`
+
+On this machine that resolves to:
+
+`C:\Users\Harnoor\Capstone\Capstone-MS07\hand-gesture-recognition-mediapipe\whisper-small`
 
 ---
 
-## Running as a Python Script (dev/team)
+## Quick Start
 
-No extra steps. On first speech activation the model downloads automatically via HuggingFace. Subsequent runs load from cache instantly.
-
-Requirements:
-```
+```bash
 pip install -r requirements.txt
-python app.py
-```
-
----
-
-## Running as the EXE (distributed build)
-
-### Step 1 — Build the EXE
-
-```
-pyinstaller hand_gesture_app.spec
-```
-
-The output is in `dist/HandGestureRecognition/`.
-
-### Step 2 — Download the Whisper model
-
-Run this **once** on the machine that will use the EXE:
-
-```python
 python download_whisper_model.py
+pyinstaller --clean -y hand_gesture_app.spec
 ```
-
-This saves the model to:
-```
-%APPDATA%\HandGestureApp\models\whisper-small\
-```
-
-> If `download_whisper_model.py` does not exist yet, you can trigger the download manually from a Python shell:
-> ```python
-> from huggingface_hub import snapshot_download
-> import os
-> model_dir = os.path.join(os.environ["APPDATA"], "HandGestureApp", "models", "whisper-small")
-> os.makedirs(model_dir, exist_ok=True)
-> snapshot_download(repo_id="Systran/faster-whisper-small", local_dir=model_dir)
-> ```
-
-### Step 3 — Run the EXE
-
-```
-dist/HandGestureRecognition/HandGestureRecognition.exe
-```
-
-The model is loaded from `%APPDATA%` on every launch — no internet required after Step 2.
 
 ---
 
-## What happens if the model is missing (EXE)
+## EXE Behavior
 
-The app launches normally and gesture recognition works. Speech mode will show:
+The EXE now prefers the bundled model inside:
 
-```
-Speech: Unavailable (Speech model not downloaded)
-```
+`dist\HandGestureRecognition\_internal\speech_models\whisper-small`
 
-No crash. Run Step 2 above and relaunch to enable speech.
+If that bundled copy is missing, it falls back to:
+
+`%APPDATA%\HandGestureApp\models\whisper-small`
 
 ---
 
-## Model location reference
+## If Speech Is Unavailable
 
-| Mode       | Model source                                              |
-|------------|-----------------------------------------------------------|
-| Script     | `~/.cache/huggingface/hub/` (managed automatically)      |
-| EXE        | `%APPDATA%\HandGestureApp\models\whisper-small\`          |
+If speech still cannot load, the app reports the exact model path it tried to use in the runtime log:
+
+`%APPDATA%\HandGestureApp\logs\hand_gesture_app.log`
+
+On this machine that resolves to:
+
+`C:\Users\Harnoor\AppData\Roaming\HandGestureApp\logs\hand_gesture_app.log`
 
 ---
 
 ## Notes
 
-- The model download is ~244 MB and only needs to happen once per machine.
-- The model folder is not included in the git repo (too large for GitHub). It lives only on the local machine.
-- `huggingface_hub` must be installed: `pip install huggingface_hub`
+- The old `vosk-model-small-en-us` folder is no longer used by speech.
+- The bundled build now takes its Whisper model from the repo-local `whisper-small` folder.
+- The Whisper model is not stored in git.
+- `faster-whisper`, `ctranslate2`, `av`, and `sounddevice` must be installed in the build environment.
