@@ -24,10 +24,10 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 class OverlayWindow(QWidget):
-    def __init__(self):
+    def __init__(self, detector=None):
         super().__init__()
 
-        self.detector = GestureDetector()
+        self.detector = detector if detector is not None else GestureDetector()
         self.overlay_visible = True
         self.table_visible = False
         # When True, frame/label are set by app (single camera read per tick); no get_frame in update_frame

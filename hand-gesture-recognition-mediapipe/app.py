@@ -7,6 +7,7 @@ import itertools
 import json
 import os
 import sys
+import ctypes
 from collections import Counter
 from collections import deque
 
@@ -91,14 +92,175 @@ except Exception as exc:
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
+from Capture import GestureDetector, open_camera
+
+
+def _configure_pyautogui():
+    if pyautogui is None:
+        return
+    # Remove the library's built-in per-call sleeps so cursor updates can keep up.
+    pyautogui.PAUSE = 0
+    if hasattr(pyautogui, "MINIMUM_DURATION"):
+        pyautogui.MINIMUM_DURATION = 0
+    if hasattr(pyautogui, "MINIMUM_SLEEP"):
+        pyautogui.MINIMUM_SLEEP = 0
+
+
+def _default_classifier_threads():
+    # These gesture classifiers are tiny; extra interpreter threads add contention.
+    return 1
+
+
+_configure_pyautogui()
+
+
+class AutomationController:
+    """Dispatch OS input without blocking gesture or speech processing threads."""
+
+    def __init__(self):
+        self._available = pyautogui is not None
+        self._stop_event = threading.Event()
+        self._action_queue = queue.Queue()
+        self._action_thread = None
+        self._mouse_event = threading.Event()
+        self._mouse_thread = None
+        self._mouse_lock = threading.Lock()
+        self._latest_mouse_pos = None
+        self._user32 = ctypes.windll.user32 if os.name == "nt" else None
+        self._screen_size = self._resolve_screen_size()
+
+    def start(self):
+        if self._action_thread is not None and self._action_thread.is_alive():
+            return
+        self._action_thread = threading.Thread(target=self._action_worker, daemon=True)
+        self._action_thread.start()
+        self._mouse_thread = threading.Thread(target=self._mouse_worker, daemon=True)
+        self._mouse_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._mouse_event.set()
+        try:
+            self._action_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._action_thread is not None and self._action_thread.is_alive():
+            self._action_thread.join(timeout=1.5)
+        if self._mouse_thread is not None and self._mouse_thread.is_alive():
+            self._mouse_thread.join(timeout=1.5)
+
+    def is_available(self):
+        return self._available
+
+    def can_type_text(self):
+        return self._available
+
+    def get_screen_size(self):
+        return self._screen_size
+
+    def move_cursor(self, x, y):
+        if self._screen_size is None:
+            return False
+        with self._mouse_lock:
+            self._latest_mouse_pos = (int(x), int(y))
+        self._mouse_event.set()
+        return True
+
+    def click(self):
+        return self._enqueue(("click",))
+
+    def hotkey(self, *keys):
+        return self._enqueue(("hotkey", keys))
+
+    def press(self, key):
+        return self._enqueue(("press", key))
+
+    def write_text(self, text):
+        if not text:
+            return False
+        return self._enqueue(("write_text", text))
+
+    def _enqueue(self, action):
+        if not self._available:
+            return False
+        try:
+            self._action_queue.put_nowait(action)
+            return True
+        except Exception:
+            return False
+
+    def _resolve_screen_size(self):
+        if self._user32 is not None:
+            try:
+                width = int(self._user32.GetSystemMetrics(0))
+                height = int(self._user32.GetSystemMetrics(1))
+                if width > 0 and height > 0:
+                    return width, height
+            except Exception:
+                pass
+        if pyautogui is None:
+            return None
+        try:
+            return pyautogui.size()
+        except Exception:
+            return None
+
+    def _move_cursor_now(self, x, y):
+        if self._user32 is not None:
+            try:
+                self._user32.SetCursorPos(int(x), int(y))
+                return
+            except Exception:
+                pass
+        if pyautogui is not None:
+            pyautogui.moveTo(int(x), int(y), duration=0.0)
+
+    def _mouse_worker(self):
+        while not self._stop_event.is_set():
+            self._mouse_event.wait(0.1)
+            self._mouse_event.clear()
+            if self._stop_event.is_set():
+                break
+            with self._mouse_lock:
+                mouse_pos = self._latest_mouse_pos
+            if mouse_pos is None:
+                continue
+            try:
+                self._move_cursor_now(*mouse_pos)
+            except Exception:
+                pass
+
+    def _action_worker(self):
+        while not self._stop_event.is_set():
+            try:
+                action = self._action_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if action is None:
+                break
+            try:
+                kind = action[0]
+                if kind == "click":
+                    pyautogui.click()
+                elif kind == "hotkey":
+                    pyautogui.hotkey(*action[1])
+                elif kind == "press":
+                    pyautogui.press(action[1])
+                elif kind == "write_text":
+                    pyautogui.write(action[1], interval=0.0)
+            except Exception:
+                pass
+            finally:
+                self._action_queue.task_done()
 
 
 class SpeechDictationController:
     """Persistent background speech-to-text worker controlled by gestures or tray actions."""
 
-    def __init__(self, sample_rate=16000, language="en"):
+    def __init__(self, input_controller=None, sample_rate=16000, language="en"):
         self.sample_rate = sample_rate
         self.language = language
+        self._input_controller = input_controller
         self._model_path = resource_path("vosk-model-small-en-us")
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -113,7 +275,12 @@ class SpeechDictationController:
         self._last_error = ""
         self._input_device_index = None
         self._input_device_name = "Unavailable"
-        self._available = (sd is not None and VoskModel is not None and pyautogui is not None)
+        self._available = (
+            sd is not None and
+            VoskModel is not None and
+            input_controller is not None and
+            input_controller.can_type_text()
+        )
         if not self._available:
             missing_parts = []
             if sd is None:
@@ -126,8 +293,8 @@ class SpeechDictationController:
                 if VOSK_IMPORT_ERROR is not None:
                     message = f"{message}: {VOSK_IMPORT_ERROR}"
                 missing_parts.append(message)
-            if pyautogui is None:
-                message = "pyautogui import failed"
+            if input_controller is None or not input_controller.can_type_text():
+                message = "input automation unavailable"
                 if PYAUTOGUI_IMPORT_ERROR is not None:
                     message = f"{message}: {PYAUTOGUI_IMPORT_ERROR}"
                 missing_parts.append(message)
@@ -319,10 +486,8 @@ class SpeechDictationController:
                                 already_typed = normalized == self._last_typed_text
                             if already_typed:
                                 continue
-                            try:
-                                pyautogui.write(normalized + " ", interval=0.0)
-                            except Exception as exc:
-                                self._set_runtime_error(exc)
+                            if not self._input_controller.write_text(normalized + " "):
+                                self._set_runtime_error(RuntimeError("Unable to queue dictated text"))
                                 continue
                             with self._lock:
                                 self._last_typed_text = normalized
@@ -378,7 +543,7 @@ def get_args():
                         type=float,
                         default=0.85)
     parser.add_argument("--high_performance",
-                        help='Enable high-performance mode (uses more CPU/GPU resources)',
+                        help='Enable high-performance mode (higher capture/display rate and lower camera latency)',
                         action='store_true',
                         default=True)
     parser.add_argument("--no_high_performance",
@@ -386,9 +551,14 @@ def get_args():
                         action='store_false',
                         dest='high_performance')
     parser.add_argument("--num_threads",
-                        help='Number of threads for TensorFlow Lite (default: 8 in high-performance, 1 otherwise)',
+                        help='Number of threads for the TFLite gesture classifiers (default: 1)',
                         type=int,
                         default=None)
+    parser.add_argument("--model_complexity",
+                        help='MediaPipe Hands model complexity: 0=lite/faster, 1=full (default: 1)',
+                        type=int,
+                        default=1,
+                        choices=[0, 1])
     parser.add_argument("--mouse_update_rate",
                         help='Mouse update rate in Hz (higher = smoother but more CPU, default: 120)',
                         type=int,
@@ -437,23 +607,24 @@ def main_new_ui(args):
     from Overlay import OverlayWindow
     from Tray import TrayIcon
 
-    speech_controller = SpeechDictationController()
+    automation_controller = AutomationController()
+    automation_controller.start()
+    speech_controller = SpeechDictationController(input_controller=automation_controller)
     speech_controller.start()
+    processing_target_fps = 60 if args.high_performance else 30
     
     # Initialize MediaPipe and classifiers
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=args.use_static_image_mode,
         max_num_hands=2,
+        model_complexity=args.model_complexity,
         min_detection_confidence=args.min_detection_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
     )
     
     # Determine number of threads for TensorFlow Lite
-    if args.high_performance:
-        num_threads = args.num_threads if args.num_threads is not None else 8
-    else:
-        num_threads = args.num_threads if args.num_threads is not None else 1
+    num_threads = args.num_threads if args.num_threads is not None else _default_classifier_threads()
 
     base_path = get_base_path()
     keypoint_model = os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier.tflite')
@@ -512,18 +683,17 @@ def main_new_ui(args):
     prev_mouse_pos = [None]  # Use list to allow mutation in nested function
     
     # Cache screen size
-    screen_width, screen_height = None, None
-    if pyautogui is not None:
-        screen_width, screen_height = pyautogui.size()
+    screen_size = automation_controller.get_screen_size()
+    if screen_size is None:
+        screen_width, screen_height = None, None
+    else:
+        screen_width, screen_height = screen_size
     
     # Mouse movement throttling
     mouse_update_interval = 1.0 / args.mouse_update_rate
     min_mouse_movement = args.min_mouse_movement
     last_mouse_update_time = [0.0]
     
-    # Debounce for hotkey actions
-    last_hotkey_time = [0.0]
-    hotkey_cooldown_sec = 1.5
     # Debounce for pinch clicks
     last_pinch_click_time = [0.0]
     pinch_click_cooldown_sec = 1.0
@@ -563,7 +733,13 @@ def main_new_ui(args):
     app = QApplication(sys.argv)
     
     # Create the overlay window
-    overlay = OverlayWindow()
+    detector = GestureDetector(
+        camera_index=args.device,
+        frame_width=args.width,
+        frame_height=args.height,
+        target_fps=processing_target_fps,
+    )
+    overlay = OverlayWindow(detector=detector)
     overlay.set_speech_controller(speech_controller)
     
     # Create the tray icon (owns gesture_hand / mouse_enabled state)
@@ -585,7 +761,7 @@ def main_new_ui(args):
 
     def process_frame_loop():
         """Process frames on a worker thread and publish the latest frame to the overlay."""
-        target_interval = 1.0 / 30.0
+        target_interval = 1.0 / processing_target_fps
 
         while not processing_stop_event.is_set():
             loop_started = time.perf_counter()
@@ -626,7 +802,7 @@ def main_new_ui(args):
                         point_history.append([0, 0])
 
                     if is_mouse_move_gesture:
-                        if pyautogui is not None:
+                        if screen_width is not None and screen_height is not None:
                             cap_width = frame.shape[1]
                             cap_height = frame.shape[0]
                             index_finger_tip = landmark_list[8]
@@ -649,7 +825,7 @@ def main_new_ui(args):
                             screen_x = max(0, min(screen_width - 1, screen_x))
                             screen_y = max(0, min(screen_height - 1, screen_y))
 
-                            now = time.time()
+                            now = time.perf_counter()
                             should_update = False
 
                             if prev_mouse_pos[0] is None:
@@ -664,7 +840,7 @@ def main_new_ui(args):
 
                             if should_update:
                                 try:
-                                    pyautogui.moveTo(screen_x, screen_y, duration=0.0)
+                                    automation_controller.move_cursor(screen_x, screen_y)
                                     prev_mouse_pos[0] = (screen_x, screen_y)
                                     last_mouse_update_time[0] = now
                                 except Exception:
@@ -672,8 +848,8 @@ def main_new_ui(args):
                     else:
                         prev_mouse_pos[0] = None
 
-                    if pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                        now = time.time()
+                    if automation_controller.is_available() and is_gesture_hand and is_pinch_gesture:
+                        now = time.perf_counter()
                         if can_activate_gesture(
                             hand_sign_label,
                             now,
@@ -681,13 +857,13 @@ def main_new_ui(args):
                             cooldown_sec=pinch_click_cooldown_sec,
                         ) and now - last_pinch_click_time[0] >= pinch_click_cooldown_sec:
                             try:
-                                pyautogui.click()
+                                automation_controller.click()
                                 last_pinch_click_time[0] = now
                             except Exception:
                                 pass
 
-                    if pyautogui is not None and is_gesture_hand:
-                        now = time.time()
+                    if automation_controller.is_available() and is_gesture_hand:
+                        now = time.perf_counter()
                         if open_label_index is not None and hand_sign_id == open_label_index:
                             handle_speech_gesture(
                                 hand_sign_id,
@@ -711,18 +887,18 @@ def main_new_ui(args):
                         elif ok_label_index is not None and hand_sign_id == ok_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
-                                    pyautogui.hotkey('ctrl', 't')
+                                    automation_controller.hotkey('ctrl', 't')
                                 except Exception:
                                     pass
                         elif four_fingers_up_label_index is not None and hand_sign_id == four_fingers_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
-                                    pyautogui.hotkey('ctrl', 'w')
+                                    automation_controller.hotkey('ctrl', 'w')
                                 except Exception:
                                     pass
 
                     if volume_interface is not None and is_gesture_hand:
-                        now = time.time()
+                        now = time.perf_counter()
                         if thumbs_up_label_index is not None and hand_sign_id == thumbs_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
@@ -740,18 +916,18 @@ def main_new_ui(args):
                                 except Exception:
                                     pass
 
-                    if pyautogui is not None and is_gesture_hand:
-                        now = time.time()
+                    if automation_controller.is_available() and is_gesture_hand:
+                        now = time.perf_counter()
                         if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
-                                    pyautogui.press('playpause')
+                                    automation_controller.press('playpause')
                                 except Exception:
                                     pass
                         elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
-                                    pyautogui.hotkey('alt', 'left')
+                                    automation_controller.hotkey('alt', 'left')
                                 except Exception:
                                     pass
 
@@ -786,7 +962,7 @@ def main_new_ui(args):
     display_timer = QTimer()
     display_timer.setTimerType(Qt.PreciseTimer)
     display_timer.timeout.connect(overlay.update_frame)
-    display_timer.start(33)
+    display_timer.start(16 if args.high_performance else 33)
 
     def shutdown():
         processing_stop_event.set()
@@ -802,6 +978,10 @@ def main_new_ui(args):
             pass
         try:
             speech_controller.stop()
+        except Exception:
+            pass
+        try:
+            automation_controller.stop()
         except Exception:
             pass
         close_method = getattr(hands, 'close', None)
@@ -825,7 +1005,9 @@ def main_new_ui(args):
 
 def main_old_ui(args):
     """Run the original OpenCV window UI with gesture recognition."""
-    speech_controller = SpeechDictationController()
+    automation_controller = AutomationController()
+    automation_controller.start()
+    speech_controller = SpeechDictationController(input_controller=automation_controller)
     speech_controller.start()
 
     cap_device = args.device
@@ -839,24 +1021,25 @@ def main_old_ui(args):
     use_brect = True
 
     # Camera preparation ###############################################################
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+    cap = open_camera(
+        camera_index=cap_device,
+        frame_width=cap_width,
+        frame_height=cap_height,
+        target_fps=60 if args.high_performance else 30,
+    )
 
     # Model load #############################################################
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
         max_num_hands=2,
+        model_complexity=args.model_complexity,
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
 
     # Determine number of threads for TensorFlow Lite
-    if args.high_performance:
-        num_threads = args.num_threads if args.num_threads is not None else 8
-    else:
-        num_threads = args.num_threads if args.num_threads is not None else 1
+    num_threads = args.num_threads if args.num_threads is not None else _default_classifier_threads()
 
     base_path = get_base_path()
     keypoint_model = os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier.tflite')
@@ -954,9 +1137,6 @@ def main_old_ui(args):
     #  ########################################################################
     mode = 0
 
-    # Debounce for hotkey actions
-    last_hotkey_time = 0.0
-    hotkey_cooldown_sec = 1.5
     # Debounce for pinch clicks
     last_pinch_click_time = 0.0
     pinch_click_cooldown_sec = 1.0
@@ -1005,41 +1185,17 @@ def main_old_ui(args):
         pointer_label_index = None
     
     # Performance optimization: Cache screen size
-    screen_width, screen_height = None, None
-    if pyautogui is not None:
-        screen_width, screen_height = pyautogui.size()
+    screen_size = automation_controller.get_screen_size()
+    if screen_size is None:
+        screen_width, screen_height = None, None
+    else:
+        screen_width, screen_height = screen_size
     
     # Mouse movement throttling
     mouse_update_rate = args.mouse_update_rate
     min_mouse_movement = args.min_mouse_movement
     mouse_update_interval = 1.0 / mouse_update_rate
     last_mouse_update_time = 0.0
-    
-    # Thread-safe mouse movement queue for high-performance mode (Event + sentinel for clean shutdown)
-    mouse_queue = queue.Queue(maxsize=1) if args.high_performance and pyautogui else None
-    mouse_stop_event = threading.Event() if (args.high_performance and pyautogui) else None
-    _MOUSE_SENTINEL = object()  # unique sentinel to signal worker to exit
-
-    def mouse_worker():
-        """Background thread for mouse movement; exits when sentinel is received or stop event is set."""
-        while not mouse_stop_event.is_set():
-            try:
-                item = mouse_queue.get(timeout=0.1)
-                if item is _MOUSE_SENTINEL:
-                    mouse_queue.task_done()
-                    break
-                x, y = item
-                pyautogui.moveTo(x, y, duration=0.0)
-                mouse_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception:
-                pass
-
-    # Start mouse worker thread if in high-performance mode
-    if mouse_queue is not None and mouse_stop_event is not None:
-        mouse_thread = threading.Thread(target=mouse_worker, daemon=True)
-        mouse_thread.start()
     
     # Drawing quality settings
     draw_quality = args.draw_quality
@@ -1118,7 +1274,7 @@ def main_old_ui(args):
                 
                 if is_mouse_move_gesture:  # Pointer on mouse hand = move cursor
                     # Air mouse control (optimized for performance)
-                    if enable_air_mouse and pyautogui is not None and mode == 0:
+                    if enable_air_mouse and screen_width is not None and screen_height is not None and mode == 0:
                         index_finger_tip = landmark_list[8]  # Index finger tip coordinates
                         
                         # Map camera coordinates to screen coordinates (full camera range -> full screen)
@@ -1147,7 +1303,7 @@ def main_old_ui(args):
                         screen_y = max(0, min(screen_height - 1, screen_y))
                         
                         # Performance optimization: Throttle mouse updates
-                        now = time.time()
+                        now = time.perf_counter()
                         should_update = False
                         
                         if prev_mouse_pos is None:
@@ -1165,16 +1321,7 @@ def main_old_ui(args):
                         
                         if should_update:
                             try:
-                                if mouse_queue is not None:
-                                    # High-performance mode: non-blocking queue
-                                    try:
-                                        mouse_queue.put_nowait((screen_x, screen_y))
-                                    except queue.Full:
-                                        # Skip if queue is full (prevents lag buildup)
-                                        pass
-                                else:
-                                    # Normal mode: direct call
-                                    pyautogui.moveTo(screen_x, screen_y, duration=0.0)
+                                automation_controller.move_cursor(screen_x, screen_y)
                                 prev_mouse_pos = (screen_x, screen_y)
                                 last_mouse_update_time = now
                             except Exception:
@@ -1184,8 +1331,8 @@ def main_old_ui(args):
                     prev_mouse_pos = None
 
                 # Pinch on gesture hand = left click after a short hold
-                if mode == 0 and pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                    now = time.time()
+                if mode == 0 and automation_controller.is_available() and is_gesture_hand and is_pinch_gesture:
+                    now = time.perf_counter()
                     if can_activate_gesture(
                         hand_sign_label,
                         now,
@@ -1193,7 +1340,7 @@ def main_old_ui(args):
                         cooldown_sec=pinch_click_cooldown_sec,
                     ) and now - last_pinch_click_time >= pinch_click_cooldown_sec:
                         try:
-                            pyautogui.click()
+                            automation_controller.click()
                             last_pinch_click_time = now
                         except Exception:
                             pass
@@ -1202,8 +1349,8 @@ def main_old_ui(args):
                 # - Only when not in logging modes (mode == 0)
                 # - Per-gesture cooldown to avoid repeated triggers
                 # - Requires pyautogui to be available
-                if mode == 0 and pyautogui is not None and is_gesture_hand:
-                    now = time.time()
+                if mode == 0 and automation_controller.is_available() and is_gesture_hand:
+                    now = time.perf_counter()
                     # Open hand -> enable speech dictation
                     if (open_label_index is not None and
                             hand_sign_id == open_label_index):
@@ -1233,7 +1380,7 @@ def main_old_ui(args):
                             hand_sign_id == ok_label_index):
                         if can_activate_gesture(hand_sign_label, now):
                             try:
-                                pyautogui.hotkey('ctrl', 't')
+                                automation_controller.hotkey('ctrl', 't')
                             except Exception:
                                 pass
                     # Four Fingers Up -> Ctrl+W (close tab)
@@ -1241,7 +1388,7 @@ def main_old_ui(args):
                           hand_sign_id == four_fingers_up_label_index):
                         if can_activate_gesture(hand_sign_label, now):
                             try:
-                                pyautogui.hotkey('ctrl', 'w')
+                                automation_controller.hotkey('ctrl', 'w')
                             except Exception:
                                 pass
                 
@@ -1250,7 +1397,7 @@ def main_old_ui(args):
                 # - Per-gesture cooldown to avoid repeated triggers
                 # - Requires volume control to be available
                 if mode == 0 and volume_interface is not None and is_gesture_hand:
-                    now = time.time()
+                    now = time.perf_counter()
                     # Thumbs Up -> Increase volume
                     if (thumbs_up_label_index is not None and
                             hand_sign_id == thumbs_up_label_index):
@@ -1276,18 +1423,18 @@ def main_old_ui(args):
                 
                 # Two Fingers Up -> Play/Pause toggle
                 # Three Fingers Up -> Go back (Alt+Left) (gesture hand only)
-                if mode == 0 and pyautogui is not None and is_gesture_hand:
-                    now = time.time()
+                if mode == 0 and automation_controller.is_available() and is_gesture_hand:
+                    now = time.perf_counter()
                     if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
                         if can_activate_gesture(hand_sign_label, now):
                             try:
-                                pyautogui.press('playpause')
+                                automation_controller.press('playpause')
                             except Exception:
                                 pass
                     elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
                         if can_activate_gesture(hand_sign_label, now):
                             try:
-                                pyautogui.hotkey('alt', 'left')
+                                automation_controller.hotkey('alt', 'left')
                             except Exception:
                                 pass
 
@@ -1326,16 +1473,8 @@ def main_old_ui(args):
         # Screen reflection #############################################################
         cv.imshow('Hand Gesture Recognition', debug_image)
 
-    # Cleanup: signal mouse worker to exit and wait for it
-    if mouse_queue is not None and mouse_stop_event is not None:
-        mouse_stop_event.set()
-        try:
-            mouse_queue.put_nowait(_MOUSE_SENTINEL)
-        except queue.Full:
-            pass
-        mouse_thread.join(timeout=1.5)
-
     speech_controller.stop()
+    automation_controller.stop()
 
     cap.release()
     cv.destroyAllWindows()
