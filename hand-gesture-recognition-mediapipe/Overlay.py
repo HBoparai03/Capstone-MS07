@@ -56,10 +56,12 @@ class OverlayWindow(QWidget):
         self.layout.setSpacing(10)
 
         # --- Camera feed ---
+        self.camera_preview_width = 320
         self.camera_label = QLabel()
-        self.camera_label.setFixedSize(320, 240)
+        self.camera_label.setFixedSize(self.camera_preview_width, 180)
+        self.camera_label.setAlignment(Qt.AlignCenter)
         self.camera_label.setStyleSheet(
-            "border: 2px solid rgba(255,255,255,0.3); border-radius: 8px;"
+            "background-color: rgba(0,0,0,0.45); border: 2px solid rgba(255,255,255,0.3); border-radius: 8px;"
         )
         self.layout.addWidget(self.camera_label, alignment=Qt.AlignTop | Qt.AlignLeft)
 
@@ -108,8 +110,8 @@ class OverlayWindow(QWidget):
 
         # Placeholder rows
         placeholders = [
-            ("Open Hand", "Enable speech dictation", "Starts microphone listening and Whisper dictation"),
-            ("Closed Fist", "Disable speech dictation", "Stops microphone listening"),
+            ("Closed Fist", "Push to talk", "Hold to start listening and dictation"),
+            ("Release Fist", "Stop listening", "Mic turns off when the closed fist is no longer detected"),
             ("OK Sign", "Open a new browser tab (Ctrl + T)", ""),
             ("Four Fingers Up", "Close the current tab. (Ctrl + W)", ""),
             ("Thumbs Up", "Volume Up (system control)", ""),
@@ -156,7 +158,7 @@ class OverlayWindow(QWidget):
         """)
         self.layout.addStretch()
 
-        self.speech_status_label = QLabel("Speech: OFF")
+        self.speech_status_label = QLabel("Speech: Starting...")
         self.speech_status_label.setStyleSheet("""
             QLabel {
                 color: white;
@@ -274,6 +276,9 @@ class OverlayWindow(QWidget):
         if frame is not None:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
+            target_height = max(1, int(round(self.camera_preview_width * h / float(w))))
+            if self.camera_label.width() != self.camera_preview_width or self.camera_label.height() != target_height:
+                self.camera_label.setFixedSize(self.camera_preview_width, target_height)
             bytes_per_line = ch * w
             image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
             self.camera_label.setPixmap(

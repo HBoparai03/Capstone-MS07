@@ -49,8 +49,7 @@ class TrayIcon:
             pystray.MenuItem(
                 lambda item: self._speech_status_label(),
                 self.toggle_speech,
-                checked=lambda item: self._speech_enabled(),
-                enabled=lambda item: self._speech_available(),
+                enabled=lambda item: False,
             ),
             pystray.MenuItem(
                 "Toggle Transcript",

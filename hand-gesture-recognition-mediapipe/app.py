@@ -111,6 +111,142 @@ def _default_classifier_threads():
     return 1
 
 
+AIR_MOUSE_HORIZONTAL_MARGIN = 0.08
+AIR_MOUSE_TOP_MARGIN = 0.08
+AIR_MOUSE_BOTTOM_MARGIN = 0.22
+AIR_MOUSE_MANUAL_OVERRIDE_DISTANCE_PX = 28
+AIR_MOUSE_REENGAGE_DISTANCE_PX = 18
+
+
+class _CursorPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def _normalize_air_mouse_coordinate(value, lower_margin, upper_margin):
+    usable_span = 1.0 - lower_margin - upper_margin
+    if usable_span <= 0:
+        return _clamp(value, 0.0, 1.0)
+    return _clamp((value - lower_margin) / usable_span, 0.0, 1.0)
+
+
+def _map_air_mouse_target(index_finger_tip, frame_width, frame_height, screen_width, screen_height, sensitivity):
+    raw_x = index_finger_tip[0] / float(frame_width)
+    raw_y = index_finger_tip[1] / float(frame_height)
+
+    # Keep cursor reach away from the weakest camera edges so lower-frame tracking is more reliable.
+    normalized_x = _normalize_air_mouse_coordinate(
+        raw_x,
+        AIR_MOUSE_HORIZONTAL_MARGIN,
+        AIR_MOUSE_HORIZONTAL_MARGIN,
+    )
+    normalized_y = _normalize_air_mouse_coordinate(
+        raw_y,
+        AIR_MOUSE_TOP_MARGIN,
+        AIR_MOUSE_BOTTOM_MARGIN,
+    )
+
+    effective_x = _clamp((normalized_x - 0.5) * sensitivity + 0.5, 0.0, 1.0)
+    effective_y = _clamp((normalized_y - 0.5) * sensitivity + 0.5, 0.0, 1.0)
+
+    screen_x = int(round(effective_x * max(0, screen_width - 1)))
+    screen_y = int(round(effective_y * max(0, screen_height - 1)))
+    return screen_x, screen_y, normalized_x, normalized_y
+
+
+def _reset_air_mouse_state(state, controller=None):
+    state["prev_pos"] = None
+    state["last_update_time"] = 0.0
+    state["manual_override"] = False
+    state["override_anchor"] = None
+    if controller is not None:
+        controller.clear_cursor_target()
+
+
+def _cursor_was_moved_manually(controller, threshold_px):
+    current_cursor = controller.get_cursor_pos()
+    last_programmatic_cursor = controller.get_last_programmatic_cursor_pos()
+    if current_cursor is None or last_programmatic_cursor is None:
+        return False, current_cursor
+
+    dx = abs(current_cursor[0] - last_programmatic_cursor[0])
+    dy = abs(current_cursor[1] - last_programmatic_cursor[1])
+    return dx >= threshold_px or dy >= threshold_px, current_cursor
+
+
+def _update_air_mouse_target(controller, landmark_list, frame_width, frame_height,
+                             screen_width, screen_height, sensitivity, smoothing,
+                             update_interval, min_movement, state):
+    screen_x, screen_y, _, _ = _map_air_mouse_target(
+        landmark_list[8],
+        frame_width,
+        frame_height,
+        screen_width,
+        screen_height,
+        sensitivity,
+    )
+
+    if state["manual_override"]:
+        override_anchor = state["override_anchor"]
+        if override_anchor is None:
+            state["override_anchor"] = (screen_x, screen_y)
+            state["prev_pos"] = controller.get_cursor_pos()
+            return
+
+        finger_delta = max(
+            abs(screen_x - override_anchor[0]),
+            abs(screen_y - override_anchor[1]),
+        )
+        if finger_delta < AIR_MOUSE_REENGAGE_DISTANCE_PX:
+            state["prev_pos"] = controller.get_cursor_pos()
+            return
+
+        state["manual_override"] = False
+        state["override_anchor"] = None
+        current_cursor = controller.get_cursor_pos()
+        state["prev_pos"] = current_cursor
+        controller.adopt_cursor_reference(current_cursor)
+
+    manual_override, current_cursor = _cursor_was_moved_manually(
+        controller,
+        AIR_MOUSE_MANUAL_OVERRIDE_DISTANCE_PX,
+    )
+    if manual_override:
+        state["manual_override"] = True
+        state["override_anchor"] = (screen_x, screen_y)
+        state["prev_pos"] = current_cursor
+        controller.clear_cursor_target()
+        return
+
+    prev_pos = state["prev_pos"]
+    if prev_pos is not None:
+        screen_x = int(screen_x * (1 - smoothing) + prev_pos[0] * smoothing)
+        screen_y = int(screen_y * (1 - smoothing) + prev_pos[1] * smoothing)
+
+    screen_x = max(0, min(screen_width - 1, screen_x))
+    screen_y = max(0, min(screen_height - 1, screen_y))
+
+    now = time.perf_counter()
+    should_update = False
+
+    if prev_pos is None:
+        should_update = True
+    else:
+        time_since_update = now - state["last_update_time"]
+        if time_since_update >= update_interval:
+            dx = abs(screen_x - prev_pos[0])
+            dy = abs(screen_y - prev_pos[1])
+            if dx >= min_movement or dy >= min_movement:
+                should_update = True
+
+    if should_update and controller.move_cursor(screen_x, screen_y):
+        state["prev_pos"] = (screen_x, screen_y)
+        state["last_update_time"] = now
+
+
 _configure_pyautogui()
 
 
@@ -126,6 +262,8 @@ class AutomationController:
         self._mouse_thread = None
         self._mouse_lock = threading.Lock()
         self._latest_mouse_pos = None
+        self._cursor_lock = threading.Lock()
+        self._last_programmatic_cursor_pos = None
         self._user32 = ctypes.windll.user32 if os.name == "nt" else None
         self._screen_size = self._resolve_screen_size()
 
@@ -158,6 +296,26 @@ class AutomationController:
     def get_screen_size(self):
         return self._screen_size
 
+    def get_cursor_pos(self):
+        if self._user32 is not None:
+            try:
+                point = _CursorPoint()
+                if self._user32.GetCursorPos(ctypes.byref(point)):
+                    return int(point.x), int(point.y)
+            except Exception:
+                pass
+        if pyautogui is None:
+            return None
+        try:
+            pos = pyautogui.position()
+            return int(pos.x), int(pos.y)
+        except Exception:
+            return None
+
+    def get_last_programmatic_cursor_pos(self):
+        with self._cursor_lock:
+            return self._last_programmatic_cursor_pos
+
     def move_cursor(self, x, y):
         if self._screen_size is None:
             return False
@@ -165,6 +323,18 @@ class AutomationController:
             self._latest_mouse_pos = (int(x), int(y))
         self._mouse_event.set()
         return True
+
+    def clear_cursor_target(self):
+        with self._mouse_lock:
+            self._latest_mouse_pos = None
+
+    def adopt_cursor_reference(self, pos=None):
+        if pos is None:
+            pos = self.get_cursor_pos()
+        if pos is None:
+            return
+        with self._cursor_lock:
+            self._last_programmatic_cursor_pos = (int(pos[0]), int(pos[1]))
 
     def click(self):
         return self._enqueue(("click",))
@@ -209,11 +379,15 @@ class AutomationController:
         if self._user32 is not None:
             try:
                 self._user32.SetCursorPos(int(x), int(y))
+                with self._cursor_lock:
+                    self._last_programmatic_cursor_pos = (int(x), int(y))
                 return
             except Exception:
                 pass
         if pyautogui is not None:
             pyautogui.moveTo(int(x), int(y), duration=0.0)
+            with self._cursor_lock:
+                self._last_programmatic_cursor_pos = (int(x), int(y))
 
     def _mouse_worker(self):
         while not self._stop_event.is_set():
@@ -255,7 +429,7 @@ class AutomationController:
 
 
 class SpeechDictationController:
-    """Persistent background speech-to-text worker controlled by gestures or tray actions."""
+    """Persistent background speech-to-text worker with push-to-talk control."""
 
     def __init__(self, input_controller=None, sample_rate=16000, language="en"):
         self.sample_rate = sample_rate
@@ -313,6 +487,7 @@ class SpeechDictationController:
             return
         self._thread = threading.Thread(target=self._speech_worker, daemon=True)
         self._thread.start()
+        self._wake_event.set()
 
     def stop(self):
         self._stop_event.set()
@@ -335,11 +510,11 @@ class SpeechDictationController:
             if not self._available:
                 return False
             changed = self._speech_enabled != enabled
+            if not changed:
+                return False
             self._speech_enabled = enabled
             if enabled:
                 self._last_typed_text = ""
-            else:
-                self._model_loading = False
         if not enabled and sd is not None:
             try:
                 sd.stop()
@@ -370,13 +545,18 @@ class SpeechDictationController:
             transcript = self._last_transcript
             last_error = self._last_error
             model_loading = self._model_loading
+            model_loaded = self._model is not None
             input_device_name = self._input_device_name
         if not available:
             status = "Speech: Unavailable"
         elif model_loading:
             status = "Speech: Loading..."
+        elif enabled:
+            status = "Speech: Listening"
+        elif model_loaded:
+            status = "Speech: Ready"
         else:
-            status = f"Speech: {'ON' if enabled else 'OFF'}"
+            status = "Speech: Starting..."
         if last_error:
             status = f"{status} ({last_error})"
         return {
@@ -443,20 +623,22 @@ class SpeechDictationController:
             with self._lock:
                 available = self._available
                 enabled = self._speech_enabled
+                model = self._model
 
             if not available:
                 self._wake_event.wait(0.25)
                 self._wake_event.clear()
                 continue
 
+            if model is None:
+                model = self._load_model()
+                if model is None:
+                    self._wake_event.wait(0.25)
+                    self._wake_event.clear()
+                    continue
+
             if not enabled:
                 self._wake_event.wait(0.1)
-                self._wake_event.clear()
-                continue
-
-            model = self._model if self._model is not None else self._load_model()
-            if model is None:
-                self._wake_event.wait(0.25)
                 self._wake_event.clear()
                 continue
 
@@ -497,17 +679,11 @@ class SpeechDictationController:
                 self._wake_event.clear()
 
 
-def handle_speech_gesture(hand_sign_id, hand_sign_label, now, open_label_index, close_label_index,
-                          speech_controller, can_activate_gesture):
-    """Use Open to enable dictation and Close to disable it, reusing gesture hold/cooldown logic."""
+def update_push_to_talk(close_hand_detected, speech_controller):
+    """Enable speech only while the close-hand push-to-talk gesture is actively held."""
     if speech_controller is None or not speech_controller.is_available():
         return
-    if open_label_index is not None and hand_sign_id == open_label_index:
-        if can_activate_gesture(hand_sign_label, now):
-            speech_controller.set_enabled(True)
-    elif close_label_index is not None and hand_sign_id == close_label_index:
-        if can_activate_gesture(hand_sign_label, now):
-            speech_controller.set_enabled(False)
+    speech_controller.set_enabled(close_hand_detected)
 
 
 def get_args():
@@ -680,7 +856,12 @@ def main_new_ui(args):
     # Air mouse control variables
     mouse_sensitivity = args.mouse_sensitivity
     mouse_smoothing = max(0.0, min(0.99, args.mouse_smoothing))
-    prev_mouse_pos = [None]  # Use list to allow mutation in nested function
+    air_mouse_state = {
+        "prev_pos": None,
+        "last_update_time": 0.0,
+        "manual_override": False,
+        "override_anchor": None,
+    }
     
     # Cache screen size
     screen_size = automation_controller.get_screen_size()
@@ -692,7 +873,6 @@ def main_new_ui(args):
     # Mouse movement throttling
     mouse_update_interval = 1.0 / args.mouse_update_rate
     min_mouse_movement = args.min_mouse_movement
-    last_mouse_update_time = [0.0]
     
     # Debounce for pinch clicks
     last_pinch_click_time = [0.0]
@@ -770,6 +950,8 @@ def main_new_ui(args):
                 processing_stop_event.wait(0.01)
                 continue
 
+            speech_push_to_talk_active = False
+
             image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
             image_rgb.flags.writeable = False
             results = hands.process(image_rgb)
@@ -795,7 +977,10 @@ def main_new_ui(args):
                     is_mouse_hand = (hand_label == tray.mouse_hand) and tray.mouse_enabled
                     is_pointer_gesture = (pointer_label_index is not None and hand_sign_id == pointer_label_index)
                     is_pinch_gesture = (pinch_label_index is not None and hand_sign_id == pinch_label_index)
+                    is_close_gesture = (close_label_index is not None and hand_sign_id == close_label_index)
                     is_mouse_move_gesture = is_pointer_gesture and is_mouse_hand
+                    if is_gesture_hand and is_close_gesture:
+                        speech_push_to_talk_active = True
                     if is_pointer_gesture or is_pinch_gesture:
                         point_history.append(landmark_list[8])
                     else:
@@ -803,50 +988,21 @@ def main_new_ui(args):
 
                     if is_mouse_move_gesture:
                         if screen_width is not None and screen_height is not None:
-                            cap_width = frame.shape[1]
-                            cap_height = frame.shape[0]
-                            index_finger_tip = landmark_list[8]
-
-                            normalized_x = index_finger_tip[0] / cap_width
-                            normalized_y = index_finger_tip[1] / cap_height
-
-                            effective_x = (normalized_x - 0.5) * mouse_sensitivity + 0.5
-                            effective_y = (normalized_y - 0.5) * mouse_sensitivity + 0.5
-                            effective_x = max(0.0, min(1.0, effective_x))
-                            effective_y = max(0.0, min(1.0, effective_y))
-
-                            screen_x = int(effective_x * screen_width)
-                            screen_y = int(effective_y * screen_height)
-
-                            if prev_mouse_pos[0] is not None:
-                                screen_x = int(screen_x * (1 - mouse_smoothing) + prev_mouse_pos[0][0] * mouse_smoothing)
-                                screen_y = int(screen_y * (1 - mouse_smoothing) + prev_mouse_pos[0][1] * mouse_smoothing)
-
-                            screen_x = max(0, min(screen_width - 1, screen_x))
-                            screen_y = max(0, min(screen_height - 1, screen_y))
-
-                            now = time.perf_counter()
-                            should_update = False
-
-                            if prev_mouse_pos[0] is None:
-                                should_update = True
-                            else:
-                                time_since_update = now - last_mouse_update_time[0]
-                                if time_since_update >= mouse_update_interval:
-                                    dx = abs(screen_x - prev_mouse_pos[0][0])
-                                    dy = abs(screen_y - prev_mouse_pos[0][1])
-                                    if dx >= min_mouse_movement or dy >= min_mouse_movement:
-                                        should_update = True
-
-                            if should_update:
-                                try:
-                                    automation_controller.move_cursor(screen_x, screen_y)
-                                    prev_mouse_pos[0] = (screen_x, screen_y)
-                                    last_mouse_update_time[0] = now
-                                except Exception:
-                                    pass
+                            _update_air_mouse_target(
+                                automation_controller,
+                                landmark_list,
+                                frame.shape[1],
+                                frame.shape[0],
+                                screen_width,
+                                screen_height,
+                                mouse_sensitivity,
+                                mouse_smoothing,
+                                mouse_update_interval,
+                                min_mouse_movement,
+                                air_mouse_state,
+                            )
                     else:
-                        prev_mouse_pos[0] = None
+                        _reset_air_mouse_state(air_mouse_state, automation_controller)
 
                     if automation_controller.is_available() and is_gesture_hand and is_pinch_gesture:
                         now = time.perf_counter()
@@ -864,27 +1020,7 @@ def main_new_ui(args):
 
                     if automation_controller.is_available() and is_gesture_hand:
                         now = time.perf_counter()
-                        if open_label_index is not None and hand_sign_id == open_label_index:
-                            handle_speech_gesture(
-                                hand_sign_id,
-                                hand_sign_label,
-                                now,
-                                open_label_index,
-                                close_label_index,
-                                speech_controller,
-                                can_activate_gesture,
-                            )
-                        elif close_label_index is not None and hand_sign_id == close_label_index:
-                            handle_speech_gesture(
-                                hand_sign_id,
-                                hand_sign_label,
-                                now,
-                                open_label_index,
-                                close_label_index,
-                                speech_controller,
-                                can_activate_gesture,
-                            )
-                        elif ok_label_index is not None and hand_sign_id == ok_label_index:
+                        if ok_label_index is not None and hand_sign_id == ok_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
                                     automation_controller.hotkey('ctrl', 't')
@@ -948,6 +1084,7 @@ def main_new_ui(args):
                 point_history.append([0, 0])
                 current_gesture[0] = "Gesture: (no hand detected)"
 
+            update_push_to_talk(speech_push_to_talk_active, speech_controller)
             overlay.set_camera_frame(frame)
             overlay.set_gesture_label(current_gesture[0])
 
@@ -1177,7 +1314,12 @@ def main_old_ui(args):
     enable_air_mouse = True  # Always enabled
     mouse_sensitivity = args.mouse_sensitivity
     mouse_smoothing = max(0.0, min(0.99, args.mouse_smoothing))  # Clamp to avoid div/edge issues
-    prev_mouse_pos = None
+    air_mouse_state = {
+        "prev_pos": None,
+        "last_update_time": 0.0,
+        "manual_override": False,
+        "override_anchor": None,
+    }
     pointer_label_index = None
     try:
         pointer_label_index = keypoint_classifier_labels.index('Pointer')
@@ -1195,7 +1337,6 @@ def main_old_ui(args):
     mouse_update_rate = args.mouse_update_rate
     min_mouse_movement = args.min_mouse_movement
     mouse_update_interval = 1.0 / mouse_update_rate
-    last_mouse_update_time = 0.0
     
     # Drawing quality settings
     draw_quality = args.draw_quality
@@ -1229,6 +1370,7 @@ def main_old_ui(args):
         image.flags.writeable = False
         results = hands.process(image)
         image.flags.writeable = True
+        speech_push_to_talk_active = False
 
         #  ####################################################################
         if results.multi_hand_landmarks is not None:
@@ -1265,8 +1407,12 @@ def main_old_ui(args):
                                      hand_sign_id == pointer_label_index)
                 is_pinch_gesture = (pinch_label_index is not None and 
                                     hand_sign_id == pinch_label_index)
+                is_close_gesture = (close_label_index is not None and
+                                    hand_sign_id == close_label_index)
                 # Cursor movement: only Pointer gesture on the mouse hand
                 is_mouse_move_gesture = is_pointer_gesture and is_mouse_hand
+                if is_gesture_hand and is_close_gesture and mode == 0:
+                    speech_push_to_talk_active = True
                 if is_pointer_gesture or is_pinch_gesture:
                     point_history.append(landmark_list[8])
                 else:
@@ -1275,60 +1421,22 @@ def main_old_ui(args):
                 if is_mouse_move_gesture:  # Pointer on mouse hand = move cursor
                     # Air mouse control (optimized for performance)
                     if enable_air_mouse and screen_width is not None and screen_height is not None and mode == 0:
-                        index_finger_tip = landmark_list[8]  # Index finger tip coordinates
-                        
-                        # Map camera coordinates to screen coordinates (full camera range -> full screen)
-                        # Normalize to 0-1 range based on camera frame
-                        normalized_x = index_finger_tip[0] / cap_width
-                        normalized_y = index_finger_tip[1] / cap_height
-                        
-                        # Convert to screen coordinates with sensitivity as gain (not range shrink)
-                        # Sensitivity: 1.0 = 1:1 mapping; >1.0 = more sensitive (small hand move = big cursor move)
-                        # Full camera range (0-1) always maps to full screen; clamp keeps cursor on screen
-                        effective_x = (normalized_x - 0.5) * mouse_sensitivity + 0.5
-                        effective_y = (normalized_y - 0.5) * mouse_sensitivity + 0.5
-                        effective_x = max(0.0, min(1.0, effective_x))
-                        effective_y = max(0.0, min(1.0, effective_y))
-                        
-                        screen_x = int(effective_x * screen_width)
-                        screen_y = int(effective_y * screen_height)
-                        
-                        # Smooth movement using previous position (slower = higher smoothing)
-                        if prev_mouse_pos is not None:
-                            screen_x = int(screen_x * (1 - mouse_smoothing) + prev_mouse_pos[0] * mouse_smoothing)
-                            screen_y = int(screen_y * (1 - mouse_smoothing) + prev_mouse_pos[1] * mouse_smoothing)
-                        
-                        # Clamp to screen bounds
-                        screen_x = max(0, min(screen_width - 1, screen_x))
-                        screen_y = max(0, min(screen_height - 1, screen_y))
-                        
-                        # Performance optimization: Throttle mouse updates
-                        now = time.perf_counter()
-                        should_update = False
-                        
-                        if prev_mouse_pos is None:
-                            # First update, always move
-                            should_update = True
-                        else:
-                            # Check if enough time has passed (rate limiting)
-                            time_since_update = now - last_mouse_update_time
-                            if time_since_update >= mouse_update_interval:
-                                # Check if movement is significant enough
-                                dx = abs(screen_x - prev_mouse_pos[0])
-                                dy = abs(screen_y - prev_mouse_pos[1])
-                                if dx >= min_mouse_movement or dy >= min_mouse_movement:
-                                    should_update = True
-                        
-                        if should_update:
-                            try:
-                                automation_controller.move_cursor(screen_x, screen_y)
-                                prev_mouse_pos = (screen_x, screen_y)
-                                last_mouse_update_time = now
-                            except Exception:
-                                pass
+                        _update_air_mouse_target(
+                            automation_controller,
+                            landmark_list,
+                            cap_width,
+                            cap_height,
+                            screen_width,
+                            screen_height,
+                            mouse_sensitivity,
+                            mouse_smoothing,
+                            mouse_update_interval,
+                            min_mouse_movement,
+                            air_mouse_state,
+                        )
                 else:
                     # Reset previous mouse position when not in pointer (move) mode
-                    prev_mouse_pos = None
+                    _reset_air_mouse_state(air_mouse_state, automation_controller)
 
                 # Pinch on gesture hand = left click after a short hold
                 if mode == 0 and automation_controller.is_available() and is_gesture_hand and is_pinch_gesture:
@@ -1351,32 +1459,8 @@ def main_old_ui(args):
                 # - Requires pyautogui to be available
                 if mode == 0 and automation_controller.is_available() and is_gesture_hand:
                     now = time.perf_counter()
-                    # Open hand -> enable speech dictation
-                    if (open_label_index is not None and
-                            hand_sign_id == open_label_index):
-                        handle_speech_gesture(
-                            hand_sign_id,
-                            hand_sign_label,
-                            now,
-                            open_label_index,
-                            close_label_index,
-                            speech_controller,
-                            can_activate_gesture,
-                        )
-                    # Close hand -> disable speech dictation
-                    elif (close_label_index is not None and
-                            hand_sign_id == close_label_index):
-                        handle_speech_gesture(
-                            hand_sign_id,
-                            hand_sign_label,
-                            now,
-                            open_label_index,
-                            close_label_index,
-                            speech_controller,
-                            can_activate_gesture,
-                        )
                     # OK sign -> Ctrl+T (new tab)
-                    elif (ok_label_index is not None and
+                    if (ok_label_index is not None and
                             hand_sign_id == ok_label_index):
                         if can_activate_gesture(hand_sign_label, now):
                             try:
@@ -1465,6 +1549,7 @@ def main_old_ui(args):
         else:
             point_history.append([0, 0])
 
+        update_push_to_talk(speech_push_to_talk_active, speech_controller)
         if draw_point_history_enabled:
             debug_image = draw_point_history(debug_image, point_history)
         if draw_info_enabled:
