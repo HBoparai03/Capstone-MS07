@@ -57,7 +57,7 @@ pip install pillow
 
 ```
 
-### Run Code (default = best settings: new UI, high performance, 8 threads, 120 Hz mouse)
+### Run Code (default = new UI, high performance, 1 classifier thread, 120 Hz mouse)
 
 ```bash
 python app.py
@@ -72,20 +72,21 @@ python app.py --ui old
 ### For balanced performance/quality
 
 ```bash
-python app.py --high_performance --num_threads 4 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --ui new
+python app.py --high_performance --num_threads 1 --draw_quality high --mouse_update_rate 60 --min_mouse_movement 2 --model_complexity 1 --ui new
 ```
 
 ### For low-end systems
 
 ```bash
-python app.py --no_high_performance --draw_quality low --mouse_update_rate 30 --min_mouse_movement 5
+python app.py --no_high_performance --draw_quality low --mouse_update_rate 30 --min_mouse_movement 5 --model_complexity 0
 ```
 
 ### Defaults (same as “Run Code” above)
 
 - `--ui new` (PyQt5 overlay)
 - `--high_performance` (use `--no_high_performance` to disable)
-- `--num_threads 8` (when high performance)
+- `--num_threads 1`
+- `--model_complexity 1`
 - `--draw_quality medium`
 - `--mouse_update_rate 120`
 - `--min_mouse_movement 2`
