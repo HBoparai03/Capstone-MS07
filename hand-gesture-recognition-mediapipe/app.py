@@ -686,6 +686,25 @@ def update_push_to_talk(close_hand_detected, speech_controller):
     speech_controller.set_enabled(close_hand_detected)
 
 
+def _get_label_index(labels, name):
+    try:
+        return labels.index(name)
+    except ValueError:
+        return None
+
+
+def _load_classifier_labels(base_path):
+    with open(os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier_label.csv'),
+              encoding='utf-8-sig') as f:
+        keypoint_classifier_labels = [row[0] for row in csv.reader(f)]
+
+    with open(os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier_label.csv'),
+              encoding='utf-8-sig') as f:
+        point_history_classifier_labels = [row[0] for row in csv.reader(f)]
+
+    return keypoint_classifier_labels, point_history_classifier_labels
+
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -705,7 +724,7 @@ def get_args():
                         default=0.7)
     parser.add_argument("--min_tracking_confidence",
                         help='min_tracking_confidence',
-                        type=int,
+                        type=float,
                         default=0.5)
     parser.add_argument("--enable_air_mouse",
                         help='Enable air mouse control when Pointer gesture is detected',
@@ -809,33 +828,19 @@ def main_new_ui(args):
     point_history_classifier = PointHistoryClassifier(model_path=point_history_model, num_threads=num_threads)
 
     # Read labels
-    with open(os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier_label.csv'),
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [row[0] for row in keypoint_classifier_labels]
-
-    with open(os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier_label.csv'),
-              encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [row[0] for row in point_history_classifier_labels]
+    keypoint_classifier_labels, point_history_classifier_labels = _load_classifier_labels(base_path)
 
     # Resolve label indices for hand signs
-    def get_label_index(labels, name):
-        try:
-            return labels.index(name)
-        except ValueError:
-            return None
-    
-    open_label_index = get_label_index(keypoint_classifier_labels, 'Open')
-    close_label_index = get_label_index(keypoint_classifier_labels, 'Close')
-    ok_label_index = get_label_index(keypoint_classifier_labels, 'OK')
-    thumbs_up_label_index = get_label_index(keypoint_classifier_labels, 'Thumbs Up')
-    thumbs_down_label_index = get_label_index(keypoint_classifier_labels, 'Thumbs Down')
-    two_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Two Fingers Up')
-    three_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Three Fingers Up')
-    four_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Four Fingers Up')
-    pointer_label_index = get_label_index(keypoint_classifier_labels, 'Pointer')
-    pinch_label_index = get_label_index(keypoint_classifier_labels, 'Pinch')
+    open_label_index = _get_label_index(keypoint_classifier_labels, 'Open')
+    close_label_index = _get_label_index(keypoint_classifier_labels, 'Close')
+    ok_label_index = _get_label_index(keypoint_classifier_labels, 'OK')
+    thumbs_up_label_index = _get_label_index(keypoint_classifier_labels, 'Thumbs Up')
+    thumbs_down_label_index = _get_label_index(keypoint_classifier_labels, 'Thumbs Down')
+    two_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Two Fingers Up')
+    three_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Three Fingers Up')
+    four_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Four Fingers Up')
+    pointer_label_index = _get_label_index(keypoint_classifier_labels, 'Pointer')
+    pinch_label_index = _get_label_index(keypoint_classifier_labels, 'Pinch')
     
     # Initialize volume control if available
     volume_interface = None
@@ -934,6 +939,8 @@ def main_new_ui(args):
     current_gesture = ["Gesture: (awaiting detection...)"]
     last_gesture_label = {}  # Track previous gesture per hand to detect changes
     processing_stop_event = threading.Event()
+    automation_available = automation_controller.is_available()
+    frame_sequence = [None]
     
 
     # Single camera read per tick: worker drives frame + gesture; overlay only displays.
@@ -945,17 +952,22 @@ def main_new_ui(args):
 
         while not processing_stop_event.is_set():
             loop_started = time.perf_counter()
-            frame = overlay.detector.get_frame()
+            frame_sequence[0], frame = overlay.detector.get_latest_frame(
+                previous_sequence=frame_sequence[0],
+                timeout=max(0.05, target_interval * 2.0),
+            )
             if frame is None:
                 processing_stop_event.wait(0.01)
                 continue
 
             speech_push_to_talk_active = False
+            frame_height, frame_width = frame.shape[:2]
 
             image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
             image_rgb.flags.writeable = False
             results = hands.process(image_rgb)
             image_rgb.flags.writeable = True
+            mouse_tracking_active_this_frame = False
 
             if results.multi_hand_landmarks is not None:
                 for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
@@ -991,8 +1003,8 @@ def main_new_ui(args):
                             _update_air_mouse_target(
                                 automation_controller,
                                 landmark_list,
-                                frame.shape[1],
-                                frame.shape[0],
+                                frame_width,
+                                frame_height,
                                 screen_width,
                                 screen_height,
                                 mouse_sensitivity,
@@ -1001,11 +1013,11 @@ def main_new_ui(args):
                                 min_mouse_movement,
                                 air_mouse_state,
                             )
-                    else:
-                        _reset_air_mouse_state(air_mouse_state, automation_controller)
+                            mouse_tracking_active_this_frame = True
 
-                    if automation_controller.is_available() and is_gesture_hand and is_pinch_gesture:
-                        now = time.perf_counter()
+                    now = time.perf_counter()
+
+                    if automation_available and is_gesture_hand and is_pinch_gesture:
                         if can_activate_gesture(
                             hand_sign_label,
                             now,
@@ -1018,8 +1030,7 @@ def main_new_ui(args):
                             except Exception:
                                 pass
 
-                    if automation_controller.is_available() and is_gesture_hand:
-                        now = time.perf_counter()
+                    if automation_available and is_gesture_hand:
                         if ok_label_index is not None and hand_sign_id == ok_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
@@ -1034,7 +1045,6 @@ def main_new_ui(args):
                                     pass
 
                     if volume_interface is not None and is_gesture_hand:
-                        now = time.perf_counter()
                         if thumbs_up_label_index is not None and hand_sign_id == thumbs_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
@@ -1052,8 +1062,7 @@ def main_new_ui(args):
                                 except Exception:
                                     pass
 
-                    if automation_controller.is_available() and is_gesture_hand:
-                        now = time.perf_counter()
+                    if automation_available and is_gesture_hand:
                         if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
@@ -1073,16 +1082,19 @@ def main_new_ui(args):
                         finger_gesture_id = point_history_classifier(pre_processed_point_history_list)
 
                     finger_gesture_history.append(finger_gesture_id)
-                    most_common_fg_id = Counter(finger_gesture_history).most_common()
+                    most_common_fg_id = Counter(finger_gesture_history).most_common(1)
 
                     handedness_label = handedness.classification[0].label
-                    finger_gesture_label = point_history_classifier_labels[most_common_fg_id[0][0]]
+                    finger_gesture_label = point_history_classifier_labels[most_common_fg_id[0][0]] if most_common_fg_id else ""
                     current_gesture[0] = f"{handedness_label}: {hand_sign_label}"
                     if finger_gesture_label:
                         current_gesture[0] += f" | {finger_gesture_label}"
             else:
                 point_history.append([0, 0])
                 current_gesture[0] = "Gesture: (no hand detected)"
+
+            if not mouse_tracking_active_this_frame:
+                _reset_air_mouse_state(air_mouse_state, automation_controller)
 
             update_push_to_talk(speech_push_to_talk_active, speech_controller)
             overlay.set_camera_frame(frame)
@@ -1158,7 +1170,7 @@ def main_old_ui(args):
     use_brect = True
 
     # Camera preparation ###############################################################
-    cap = open_camera(
+    detector = GestureDetector(
         camera_index=cap_device,
         frame_width=cap_width,
         frame_height=cap_height,
@@ -1185,64 +1197,18 @@ def main_old_ui(args):
     point_history_classifier = PointHistoryClassifier(model_path=point_history_model, num_threads=num_threads)
 
     # Read labels ###########################################################
-    with open(os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier_label.csv'),
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [
-            row[0] for row in keypoint_classifier_labels
-        ]
-    with open(os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier_label.csv'),
-              encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [
-            row[0] for row in point_history_classifier_labels
-        ]
+    keypoint_classifier_labels, point_history_classifier_labels = _load_classifier_labels(base_path)
 
     # Resolve label indices for hand signs (if present)
-    try:
-        open_label_index = keypoint_classifier_labels.index('Open')
-    except ValueError:
-        open_label_index = None
-    
-    try:
-        close_label_index = keypoint_classifier_labels.index('Close')
-    except ValueError:
-        close_label_index = None
-    
-    try:
-        ok_label_index = keypoint_classifier_labels.index('OK')
-    except ValueError:
-        ok_label_index = None
-
-    try:
-        thumbs_up_label_index = keypoint_classifier_labels.index('Thumbs Up')
-    except ValueError:
-        thumbs_up_label_index = None
-    
-    try:
-        thumbs_down_label_index = keypoint_classifier_labels.index('Thumbs Down')
-    except ValueError:
-        thumbs_down_label_index = None
-
-    try:
-        two_fingers_up_label_index = keypoint_classifier_labels.index('Two Fingers Up')
-    except ValueError:
-        two_fingers_up_label_index = None
-
-    try:
-        three_fingers_up_label_index = keypoint_classifier_labels.index('Three Fingers Up')
-    except ValueError:
-        three_fingers_up_label_index = None
-
-    try:
-        four_fingers_up_label_index = keypoint_classifier_labels.index('Four Fingers Up')
-    except ValueError:
-        four_fingers_up_label_index = None
-
-    try:
-        pinch_label_index = keypoint_classifier_labels.index('Pinch')
-    except ValueError:
-        pinch_label_index = None
+    open_label_index = _get_label_index(keypoint_classifier_labels, 'Open')
+    close_label_index = _get_label_index(keypoint_classifier_labels, 'Close')
+    ok_label_index = _get_label_index(keypoint_classifier_labels, 'OK')
+    thumbs_up_label_index = _get_label_index(keypoint_classifier_labels, 'Thumbs Up')
+    thumbs_down_label_index = _get_label_index(keypoint_classifier_labels, 'Thumbs Down')
+    two_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Two Fingers Up')
+    three_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Three Fingers Up')
+    four_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Four Fingers Up')
+    pinch_label_index = _get_label_index(keypoint_classifier_labels, 'Pinch')
 
     # Hand assignment: mouse hand = Pointer (cursor movement); gesture hand = all other gestures including Pinch (left click)
     gesture_hand_label = args.gesturehand.capitalize()   # "Left" or "Right"
@@ -1320,11 +1286,7 @@ def main_old_ui(args):
         "manual_override": False,
         "override_anchor": None,
     }
-    pointer_label_index = None
-    try:
-        pointer_label_index = keypoint_classifier_labels.index('Pointer')
-    except ValueError:
-        pointer_label_index = None
+    pointer_label_index = _get_label_index(keypoint_classifier_labels, 'Pointer')
     
     # Performance optimization: Cache screen size
     screen_size = automation_controller.get_screen_size()
@@ -1346,6 +1308,8 @@ def main_old_ui(args):
     
     # Track previous gesture per hand to detect changes
     last_gesture_label = {}
+    automation_available = automation_controller.is_available()
+    frame_sequence = None
 
     while True:
         fps = cvFpsCalc.get()
@@ -1357,10 +1321,9 @@ def main_old_ui(args):
         number, mode = select_mode(key, mode)
 
         # Camera capture #####################################################
-        ret, image = cap.read()
-        if not ret:
-            break
-        image = cv.flip(image, 1)  # Mirror display
+        frame_sequence, image = detector.get_latest_frame(previous_sequence=frame_sequence, timeout=0.1)
+        if image is None:
+            continue
         # Performance: Use .copy() instead of deepcopy (much faster for 2D arrays)
         debug_image = image.copy()
 
@@ -1371,15 +1334,14 @@ def main_old_ui(args):
         results = hands.process(image)
         image.flags.writeable = True
         speech_push_to_talk_active = False
+        mouse_tracking_active_this_frame = False
 
         #  ####################################################################
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
                                                   results.multi_handedness):
-                # Bounding box calculation
-                brect = calc_bounding_rect(debug_image, hand_landmarks)
-                # Landmark calculation
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
+                brect = calc_bounding_rect(debug_image, landmark_list)
 
                 # Conversion to relative coordinates / normalized coordinates
                 pre_processed_landmark_list = pre_process_landmark(
@@ -1434,13 +1396,12 @@ def main_old_ui(args):
                             min_mouse_movement,
                             air_mouse_state,
                         )
-                else:
-                    # Reset previous mouse position when not in pointer (move) mode
-                    _reset_air_mouse_state(air_mouse_state, automation_controller)
+                        mouse_tracking_active_this_frame = True
+
+                now = time.perf_counter()
 
                 # Pinch on gesture hand = left click after a short hold
-                if mode == 0 and automation_controller.is_available() and is_gesture_hand and is_pinch_gesture:
-                    now = time.perf_counter()
+                if mode == 0 and automation_available and is_gesture_hand and is_pinch_gesture:
                     if can_activate_gesture(
                         hand_sign_label,
                         now,
@@ -1457,8 +1418,7 @@ def main_old_ui(args):
                 # - Only when not in logging modes (mode == 0)
                 # - Per-gesture cooldown to avoid repeated triggers
                 # - Requires pyautogui to be available
-                if mode == 0 and automation_controller.is_available() and is_gesture_hand:
-                    now = time.perf_counter()
+                if mode == 0 and automation_available and is_gesture_hand:
                     # OK sign -> Ctrl+T (new tab)
                     if (ok_label_index is not None and
                             hand_sign_id == ok_label_index):
@@ -1481,7 +1441,6 @@ def main_old_ui(args):
                 # - Per-gesture cooldown to avoid repeated triggers
                 # - Requires volume control to be available
                 if mode == 0 and volume_interface is not None and is_gesture_hand:
-                    now = time.perf_counter()
                     # Thumbs Up -> Increase volume
                     if (thumbs_up_label_index is not None and
                             hand_sign_id == thumbs_up_label_index):
@@ -1507,8 +1466,7 @@ def main_old_ui(args):
                 
                 # Two Fingers Up -> Play/Pause toggle
                 # Three Fingers Up -> Go back (Alt+Left) (gesture hand only)
-                if mode == 0 and automation_controller.is_available() and is_gesture_hand:
-                    now = time.perf_counter()
+                if mode == 0 and automation_available and is_gesture_hand:
                     if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
                         if can_activate_gesture(hand_sign_label, now):
                             try:
@@ -1531,8 +1489,7 @@ def main_old_ui(args):
 
                 # Calculates the gesture IDs in the latest detection
                 finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
+                most_common_fg_id = Counter(finger_gesture_history).most_common(1)
 
                 # Drawing part (optimized based on quality setting)
                 if use_brect:
@@ -1544,10 +1501,13 @@ def main_old_ui(args):
                     brect,
                     handedness,
                     keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
+                    point_history_classifier_labels[most_common_fg_id[0][0]] if most_common_fg_id else "",
                 )
         else:
             point_history.append([0, 0])
+
+        if not mouse_tracking_active_this_frame:
+            _reset_air_mouse_state(air_mouse_state, automation_controller)
 
         update_push_to_talk(speech_push_to_talk_active, speech_controller)
         if draw_point_history_enabled:
@@ -1561,7 +1521,7 @@ def main_old_ui(args):
     speech_controller.stop()
     automation_controller.stop()
 
-    cap.release()
+    detector.release()
     cv.destroyAllWindows()
 
 
@@ -1578,16 +1538,21 @@ def select_mode(key, mode):
     return number, mode
 
 
-def calc_bounding_rect(image, landmarks):
+def calc_landmark_array(image, landmarks):
     image_width, image_height = image.shape[1], image.shape[0]
-
-    # Performance: Pre-allocate array instead of appending
-    landmark_array = np.zeros((21, 2), dtype=np.int32)
+    landmark_array = np.empty((len(landmarks.landmark), 2), dtype=np.int32)
 
     for idx, landmark in enumerate(landmarks.landmark):
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        landmark_array[idx] = [landmark_x, landmark_y]
+        landmark_array[idx, 0] = landmark_x
+        landmark_array[idx, 1] = landmark_y
+
+    return landmark_array
+
+
+def calc_bounding_rect(image, landmarks):
+    landmark_array = landmarks if isinstance(landmarks, np.ndarray) else calc_landmark_array(image, landmarks)
 
     x, y, w, h = cv.boundingRect(landmark_array)
 
@@ -1595,24 +1560,13 @@ def calc_bounding_rect(image, landmarks):
 
 
 def calc_landmark_list(image, landmarks):
-    image_width, image_height = image.shape[1], image.shape[0]
-
-    landmark_point = []
-
-    # Keypoint
-    for _, landmark in enumerate(landmarks.landmark):
-        landmark_x = min(int(landmark.x * image_width), image_width - 1)
-        landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        # landmark_z = landmark.z
-
-        landmark_point.append([landmark_x, landmark_y])
-
-    return landmark_point
+    if isinstance(landmarks, np.ndarray):
+        return landmarks
+    return calc_landmark_array(image, landmarks)
 
 
 def pre_process_landmark(landmark_list):
-    # Performance: Use NumPy array instead of list operations
-    temp_landmark_list = np.array(landmark_list, dtype=np.float32)
+    temp_landmark_list = np.asarray(landmark_list, dtype=np.float32).copy()
 
     # Convert to relative coordinates
     base_x, base_y = temp_landmark_list[0, 0], temp_landmark_list[0, 1]
@@ -1627,19 +1581,18 @@ def pre_process_landmark(landmark_list):
     if max_value > 0:
         temp_landmark_list = temp_landmark_list / max_value
     else:
-        temp_landmark_list = temp_landmark_list * 0.0
+        temp_landmark_list = np.zeros_like(temp_landmark_list)
 
-    return temp_landmark_list.tolist()
+    return temp_landmark_list
 
 
 def pre_process_point_history(image, point_history):
     image_width, image_height = image.shape[1], image.shape[0]
 
-    # Performance: Use NumPy array instead of list operations
     if len(point_history) == 0:
-        return []
+        return np.empty((0,), dtype=np.float32)
     
-    temp_point_history = np.array(point_history, dtype=np.float32)
+    temp_point_history = np.asarray(point_history, dtype=np.float32).copy()
 
     # Convert to relative coordinates
     base_x, base_y = temp_point_history[0, 0], temp_point_history[0, 1]
@@ -1649,7 +1602,7 @@ def pre_process_point_history(image, point_history):
     # Convert to a one-dimensional list
     temp_point_history = temp_point_history.flatten()
 
-    return temp_point_history.tolist()
+    return temp_point_history
 
 
 def logging_csv(number, mode, landmark_list, point_history_list):
