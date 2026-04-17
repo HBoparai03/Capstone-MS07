@@ -27,10 +27,11 @@ class TrayActionBridge(QObject):
 
 
 class TrayIcon:
-    def __init__(self, window, gesture_hand="Right", mouse_enabled=True):
+    def __init__(self, window, gesture_hand="Right", mouse_enabled=True, speech_controller=None):
         self.window = window
         self.gesture_hand = gesture_hand
         self.mouse_enabled = mouse_enabled
+        self.speech_controller = speech_controller
         self._bridge = None
 
         self.icon = pystray.Icon("Gesture Overlay", self._create_icon(), "Gesture Overlay", menu=pystray.Menu(
@@ -44,6 +45,17 @@ class TrayIcon:
             pystray.MenuItem(
                 lambda item: f"Gesture Hand: {self.gesture_hand}  |  Mouse Hand: {self.mouse_hand}",
                 self.toggle_left_right,
+            ),
+            pystray.MenuItem(
+                lambda item: self._speech_status_label(),
+                self.toggle_speech,
+                enabled=lambda item: False,
+            ),
+            pystray.MenuItem(
+                "Toggle Transcript",
+                self.toggle_transcript,
+                checked=lambda item: self._transcript_visible(),
+                enabled=lambda item: self._speech_available(),
             ),
             pystray.MenuItem("Exit", self.exit_app)
         ))
@@ -59,6 +71,26 @@ class TrayIcon:
             # Fallback so tray still appears if icon fails
             img = Image.new("RGB", (64, 64), color="black")
             return img
+
+    def _speech_enabled(self):
+        if self.speech_controller is None or not self.speech_controller.is_available():
+            return False
+        return self.speech_controller.get_snapshot()["enabled"]
+
+    def _speech_available(self):
+        if self.speech_controller is None:
+            return False
+        return self.speech_controller.is_available()
+
+    def _speech_status_label(self):
+        if self.speech_controller is None:
+            return "Speech: Unavailable"
+        return self.speech_controller.get_snapshot()["status"]
+
+    def _transcript_visible(self):
+        if self.speech_controller is None:
+            return False
+        return self.speech_controller.get_snapshot()["show_transcript"]
 
 
     def _on_tray_action(self, action):
@@ -122,6 +154,16 @@ class TrayIcon:
 
     def toggle_mouse(self, icon, item):
         self.mouse_enabled = not self.mouse_enabled
+        icon.update_menu()
+
+    def toggle_speech(self, icon, item):
+        if self.speech_controller is not None:
+            self.speech_controller.toggle_enabled()
+        icon.update_menu()
+
+    def toggle_transcript(self, icon, item):
+        if self.speech_controller is not None:
+            self.speech_controller.toggle_transcript()
         icon.update_menu()
 
     def run(self):

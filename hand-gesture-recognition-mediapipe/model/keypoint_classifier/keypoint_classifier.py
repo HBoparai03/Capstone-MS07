@@ -17,21 +17,17 @@ class KeyPointClassifier(object):
         self.interpreter.allocate_tensors()
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
+        self._input_index = self.input_details[0]['index']
+        self._output_index = self.output_details[0]['index']
+        self._input_buffer = np.zeros(self.input_details[0]['shape'], dtype=np.float32)
 
     def __call__(
         self,
         landmark_list,
     ):
-        input_details_tensor_index = self.input_details[0]['index']
-        self.interpreter.set_tensor(
-            input_details_tensor_index,
-            np.array([landmark_list], dtype=np.float32))
+        np.copyto(self._input_buffer[0], np.asarray(landmark_list, dtype=np.float32), casting='unsafe')
+        self.interpreter.set_tensor(self._input_index, self._input_buffer)
         self.interpreter.invoke()
 
-        output_details_tensor_index = self.output_details[0]['index']
-
-        result = self.interpreter.get_tensor(output_details_tensor_index)
-
-        result_index = np.argmax(np.squeeze(result))
-
-        return result_index
+        result = self.interpreter.get_tensor(self._output_index)[0]
+        return int(np.argmax(result))
