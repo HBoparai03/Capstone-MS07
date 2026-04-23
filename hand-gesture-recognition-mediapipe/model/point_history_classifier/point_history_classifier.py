@@ -19,6 +19,9 @@ class PointHistoryClassifier(object):
         self.interpreter.allocate_tensors()
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
+        self._input_index = self.input_details[0]['index']
+        self._output_index = self.output_details[0]['index']
+        self._input_buffer = np.zeros(self.input_details[0]['shape'], dtype=np.float32)
 
         self.score_th = score_th
         self.invalid_value = invalid_value
@@ -27,19 +30,14 @@ class PointHistoryClassifier(object):
         self,
         point_history,
     ):
-        input_details_tensor_index = self.input_details[0]['index']
-        self.interpreter.set_tensor(
-            input_details_tensor_index,
-            np.array([point_history], dtype=np.float32))
+        np.copyto(self._input_buffer[0], np.asarray(point_history, dtype=np.float32), casting='unsafe')
+        self.interpreter.set_tensor(self._input_index, self._input_buffer)
         self.interpreter.invoke()
 
-        output_details_tensor_index = self.output_details[0]['index']
+        result = self.interpreter.get_tensor(self._output_index)[0]
+        result_index = int(np.argmax(result))
 
-        result = self.interpreter.get_tensor(output_details_tensor_index)
-
-        result_index = np.argmax(np.squeeze(result))
-
-        if np.squeeze(result)[result_index] < self.score_th:
+        if result[result_index] < self.score_th:
             result_index = self.invalid_value
 
         return result_index

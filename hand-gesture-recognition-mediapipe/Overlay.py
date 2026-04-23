@@ -13,6 +13,7 @@ import ctypes
 import cv2
 import os
 import sys
+import threading
 from Capture import GestureDetector
 
 def resource_path(relative_path):
@@ -24,10 +25,10 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 class OverlayWindow(QWidget):
-    def __init__(self):
+    def __init__(self, detector=None):
         super().__init__()
 
-        self.detector = GestureDetector()
+        self.detector = detector if detector is not None else GestureDetector()
         self.overlay_visible = True
         self.table_visible = False
         # When True, frame/label are set by app (single camera read per tick); no get_frame in update_frame
@@ -35,6 +36,13 @@ class OverlayWindow(QWidget):
         self._last_frame = None
         self._last_gesture_label = None
         self._speech_controller = None
+        self._state_lock = threading.Lock()
+        self._last_rendered_frame = None
+        self._last_rendered_size = None
+        self._last_camera_pixmap = None
+        self._last_status_text = None
+        self._last_transcript_text = None
+        self._last_gesture_text = None
 
         # --- Window Setup ---
         self.setWindowTitle("Gesture Overlay")
@@ -56,10 +64,12 @@ class OverlayWindow(QWidget):
         self.layout.setSpacing(10)
 
         # --- Camera feed ---
+        self.camera_preview_width = 320
         self.camera_label = QLabel()
-        self.camera_label.setFixedSize(320, 240)
+        self.camera_label.setFixedSize(self.camera_preview_width, 180)
+        self.camera_label.setAlignment(Qt.AlignCenter)
         self.camera_label.setStyleSheet(
-            "border: 2px solid rgba(255,255,255,0.3); border-radius: 8px;"
+            "background-color: rgba(0,0,0,0.45); border: 2px solid rgba(255,255,255,0.3); border-radius: 8px;"
         )
         self.layout.addWidget(self.camera_label, alignment=Qt.AlignTop | Qt.AlignLeft)
 
@@ -108,8 +118,8 @@ class OverlayWindow(QWidget):
 
         # Placeholder rows
         placeholders = [
-            ("Open Hand", "Enable speech dictation", "Starts microphone listening and Whisper dictation"),
-            ("Closed Fist", "Disable speech dictation", "Stops microphone listening"),
+            ("Closed Fist", "Push to talk", "Hold to start listening and dictation"),
+            ("Release Fist", "Stop listening", "Mic turns off when the closed fist is no longer detected"),
             ("OK Sign", "Open a new browser tab (Ctrl + T)", ""),
             ("Four Fingers Up", "Close the current tab. (Ctrl + W)", ""),
             ("Thumbs Up", "Volume Up (system control)", ""),
@@ -156,7 +166,7 @@ class OverlayWindow(QWidget):
         """)
         self.layout.addStretch()
 
-        self.speech_status_label = QLabel("Speech: OFF")
+        self.speech_status_label = QLabel("Speech: Starting...")
         self.speech_status_label.setStyleSheet("""
             QLabel {
                 color: white;
@@ -234,11 +244,13 @@ class OverlayWindow(QWidget):
 
     def set_camera_frame(self, frame):
         """Set the frame to display (used when app_driven)."""
-        self._last_frame = frame
+        with self._state_lock:
+            self._last_frame = frame
 
     def set_gesture_label(self, text):
         """Set the gesture label (used when app_driven)."""
-        self._last_gesture_label = text
+        with self._state_lock:
+            self._last_gesture_label = text
 
     def set_speech_controller(self, controller):
         self._speech_controller = controller
@@ -266,30 +278,45 @@ class OverlayWindow(QWidget):
     def update_frame(self):
         if self._app_driven:
             # Frame and label are set by app; just refresh display from last set values
-            frame = self._last_frame
-            text = self._last_gesture_label if self._last_gesture_label is not None else "Gesture: (awaiting...)"
+            with self._state_lock:
+                frame = self._last_frame
+                text = self._last_gesture_label if self._last_gesture_label is not None else "Gesture: (awaiting...)"
         else:
             frame = self.detector.get_frame()
             text = self.detector.get_gesture_label()
         if frame is not None:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb.shape
-            bytes_per_line = ch * w
-            image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            self.camera_label.setPixmap(
-                QPixmap.fromImage(image).scaled(
+            h, w = frame.shape[:2]
+            target_height = max(1, int(round(self.camera_preview_width * h / float(w))))
+            if self.camera_label.width() != self.camera_preview_width or self.camera_label.height() != target_height:
+                self.camera_label.setFixedSize(self.camera_preview_width, target_height)
+            target_size = (self.camera_label.width(), self.camera_label.height())
+            if frame is not self._last_rendered_frame or target_size != self._last_rendered_size:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                _, _, ch = rgb.shape
+                bytes_per_line = ch * w
+                image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                self._last_camera_pixmap = QPixmap.fromImage(image).scaled(
                     self.camera_label.size(),
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation
                 )
-            )
-        if text is not None:
+                self._last_rendered_frame = frame
+                self._last_rendered_size = target_size
+            if self._last_camera_pixmap is not None:
+                self.camera_label.setPixmap(self._last_camera_pixmap)
+        if text is not None and text != self._last_gesture_text:
             self.gesture_label.setText(text)
+            self._last_gesture_text = text
         if self._speech_controller is not None:
             snapshot = self._speech_controller.get_snapshot()
-            self.speech_status_label.setText(snapshot["status"])
+            if snapshot["status"] != self._last_status_text:
+                self.speech_status_label.setText(snapshot["status"])
+                self._last_status_text = snapshot["status"]
             transcript = snapshot["transcript"] if snapshot["transcript"] else "(awaiting speech)"
-            self.transcript_label.setText(f"Transcript: {transcript}")
+            transcript_text = f"Transcript: {transcript}"
+            if transcript_text != self._last_transcript_text:
+                self.transcript_label.setText(transcript_text)
+                self._last_transcript_text = transcript_text
             self.transcript_label.setVisible(snapshot["show_transcript"])
 
     # ----------------------------

@@ -7,6 +7,7 @@ Capstone_venv/
 
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -26,7 +27,11 @@ __pycache__/
 build/
 dist/
 
+# Vosk model (too large for git — run download_vosk_model.py to get it)
+vosk-model-small-en-us/
+
 # OS
 .DS_Store
 Thumbs.db
 
+vosk-model-small-en-us

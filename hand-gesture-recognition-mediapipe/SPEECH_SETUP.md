@@ -1,90 +1,65 @@
 # Speech-to-Text Setup
 
-The speech dictation feature uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (Whisper small model, ~244 MB).
-
-When running as a **Python script**, the model is downloaded automatically to the HuggingFace cache on first use — no setup needed.
-
-When running as a **built EXE**, the model must be downloaded separately to a local folder before speech will work. The EXE cannot download it on its own.
+The speech dictation feature uses [Vosk](https://alphacephei.com/vosk/) for fully offline, local speech recognition (~50 MB model, no internet after setup).
 
 ---
 
-## Running as a Python Script (dev/team)
+## Quick Start
 
-No extra steps. On first speech activation the model downloads automatically via HuggingFace. Subsequent runs load from cache instantly.
-
-Requirements:
 ```
 pip install -r requirements.txt
+python download_vosk_model.py
 python app.py
 ```
 
+That's it. The download script handles everything.
+
 ---
 
-## Running as the EXE (distributed build)
+## What `download_vosk_model.py` does
 
-### Step 1 — Build the EXE
+- Downloads `vosk-model-small-en-us-0.15` (~50 MB) from the official Vosk site
+- Extracts and places it as `vosk-model-small-en-us/` next to `app.py`
+- Safe to re-run — skips download if the folder already exists
 
 ```
+hand-gesture-recognition-mediapipe/
+    app.py
+    download_vosk_model.py
+    vosk-model-small-en-us/        <-- created by the script
+```
+
+The model folder is in `.gitignore` — each developer runs the script once.
+
+---
+
+## Building the EXE
+
+Run the download script **before** building. The spec auto-detects the model folder and bundles it.
+
+```
+python download_vosk_model.py
 pyinstaller hand_gesture_app.spec
 ```
 
-The output is in `dist/HandGestureRecognition/`.
-
-### Step 2 — Download the Whisper model
-
-Run this **once** on the machine that will use the EXE:
-
-```python
-python download_whisper_model.py
-```
-
-This saves the model to:
-```
-%APPDATA%\HandGestureApp\models\whisper-small\
-```
-
-> If `download_whisper_model.py` does not exist yet, you can trigger the download manually from a Python shell:
-> ```python
-> from huggingface_hub import snapshot_download
-> import os
-> model_dir = os.path.join(os.environ["APPDATA"], "HandGestureApp", "models", "whisper-small")
-> os.makedirs(model_dir, exist_ok=True)
-> snapshot_download(repo_id="Systran/faster-whisper-small", local_dir=model_dir)
-> ```
-
-### Step 3 — Run the EXE
-
-```
-dist/HandGestureRecognition/HandGestureRecognition.exe
-```
-
-The model is loaded from `%APPDATA%` on every launch — no internet required after Step 2.
+The built EXE in `dist/HandGestureRecognition/` is fully self-contained — no internet required on the end user's machine.
 
 ---
 
-## What happens if the model is missing (EXE)
+## What happens if the model folder is missing
 
-The app launches normally and gesture recognition works. Speech mode will show:
+The app launches normally, gesture recognition works. Speech mode shows:
 
 ```
-Speech: Unavailable (Speech model not downloaded)
+Speech: Unavailable (Speech model not found)
 ```
 
-No crash. Run Step 2 above and relaunch to enable speech.
-
----
-
-## Model location reference
-
-| Mode       | Model source                                              |
-|------------|-----------------------------------------------------------|
-| Script     | `~/.cache/huggingface/hub/` (managed automatically)      |
-| EXE        | `%APPDATA%\HandGestureApp\models\whisper-small\`          |
+No crash. Run `python download_vosk_model.py` and relaunch.
 
 ---
 
 ## Notes
 
-- The model download is ~244 MB and only needs to happen once per machine.
-- The model folder is not included in the git repo (too large for GitHub). It lives only on the local machine.
-- `huggingface_hub` must be installed: `pip install huggingface_hub`
+- Vosk runs fully offline after the one-time download
+- The model folder is excluded from git — run the script once per machine
+- Accuracy is lower than Whisper but sufficient for short dictation phrases

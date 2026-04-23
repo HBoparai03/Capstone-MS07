@@ -4,8 +4,10 @@ import csv
 import copy
 import argparse
 import itertools
+import json
 import os
 import sys
+import ctypes
 from collections import Counter
 from collections import deque
 
@@ -13,16 +15,42 @@ if hasattr(sys, "_MEIPASS"):
     os.environ["MEDIAPIPE_RESOURCE_PATH"] = sys._MEIPASS
 
 
+def _candidate_base_paths():
+    candidates = []
+
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(sys._MEIPASS)
+
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(exe_dir)
+        candidates.append(os.path.join(exe_dir, "_internal"))
+
+    candidates.append(os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(os.path.abspath("."))
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_candidates.append(candidate)
+
+    return unique_candidates
+
+
 def resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+    for base_path in _candidate_base_paths():
+        candidate = os.path.join(base_path, relative_path)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(_candidate_base_paths()[0], relative_path)
 
 def get_base_path():
     """Return base path for resources (works when run as script or as PyInstaller exe)."""
-    if getattr(sys, 'frozen', False):
-        return sys._MEIPASS
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(resource_path("app.py")) if os.path.exists(resource_path("app.py")) else _candidate_base_paths()[0]
 
 import cv2 as cv
 import numpy as np
@@ -33,8 +61,10 @@ import queue
 
 try:
     import pyautogui  # For sending Ctrl+T to active window and mouse control
-except Exception:
+    PYAUTOGUI_IMPORT_ERROR = None
+except Exception as exc:
     pyautogui = None
+    PYAUTOGUI_IMPORT_ERROR = exc
 
 try:
     from ctypes import cast, POINTER
@@ -46,28 +76,366 @@ except Exception:
 
 try:
     import sounddevice as sd
-except Exception:
+    SOUNDDEVICE_IMPORT_ERROR = None
+except Exception as exc:
     sd = None
+    SOUNDDEVICE_IMPORT_ERROR = exc
 
 try:
-    from faster_whisper import WhisperModel
-except Exception:
-    WhisperModel = None
+    from vosk import Model as VoskModel, KaldiRecognizer
+    VOSK_IMPORT_ERROR = None
+except Exception as exc:
+    VoskModel = None
+    KaldiRecognizer = None
+    VOSK_IMPORT_ERROR = exc
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
+from Capture import GestureDetector, open_camera
+
+
+def _configure_pyautogui():
+    if pyautogui is None:
+        return
+    # Remove the library's built-in per-call sleeps so cursor updates can keep up.
+    pyautogui.PAUSE = 0
+    if hasattr(pyautogui, "MINIMUM_DURATION"):
+        pyautogui.MINIMUM_DURATION = 0
+    if hasattr(pyautogui, "MINIMUM_SLEEP"):
+        pyautogui.MINIMUM_SLEEP = 0
+
+
+def _default_classifier_threads():
+    # These gesture classifiers are tiny; extra interpreter threads add contention.
+    return 1
+
+
+AIR_MOUSE_HORIZONTAL_MARGIN = 0.08
+AIR_MOUSE_TOP_MARGIN = 0.08
+AIR_MOUSE_BOTTOM_MARGIN = 0.22
+AIR_MOUSE_MANUAL_OVERRIDE_DISTANCE_PX = 28
+AIR_MOUSE_REENGAGE_DISTANCE_PX = 18
+
+
+class _CursorPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def _normalize_air_mouse_coordinate(value, lower_margin, upper_margin):
+    usable_span = 1.0 - lower_margin - upper_margin
+    if usable_span <= 0:
+        return _clamp(value, 0.0, 1.0)
+    return _clamp((value - lower_margin) / usable_span, 0.0, 1.0)
+
+
+def _map_air_mouse_target(index_finger_tip, frame_width, frame_height, screen_width, screen_height, sensitivity):
+    raw_x = index_finger_tip[0] / float(frame_width)
+    raw_y = index_finger_tip[1] / float(frame_height)
+
+    # Keep cursor reach away from the weakest camera edges so lower-frame tracking is more reliable.
+    normalized_x = _normalize_air_mouse_coordinate(
+        raw_x,
+        AIR_MOUSE_HORIZONTAL_MARGIN,
+        AIR_MOUSE_HORIZONTAL_MARGIN,
+    )
+    normalized_y = _normalize_air_mouse_coordinate(
+        raw_y,
+        AIR_MOUSE_TOP_MARGIN,
+        AIR_MOUSE_BOTTOM_MARGIN,
+    )
+
+    effective_x = _clamp((normalized_x - 0.5) * sensitivity + 0.5, 0.0, 1.0)
+    effective_y = _clamp((normalized_y - 0.5) * sensitivity + 0.5, 0.0, 1.0)
+
+    screen_x = int(round(effective_x * max(0, screen_width - 1)))
+    screen_y = int(round(effective_y * max(0, screen_height - 1)))
+    return screen_x, screen_y, normalized_x, normalized_y
+
+
+def _reset_air_mouse_state(state, controller=None):
+    state["prev_pos"] = None
+    state["last_update_time"] = 0.0
+    state["manual_override"] = False
+    state["override_anchor"] = None
+    if controller is not None:
+        controller.clear_cursor_target()
+
+
+def _cursor_was_moved_manually(controller, threshold_px):
+    current_cursor = controller.get_cursor_pos()
+    last_programmatic_cursor = controller.get_last_programmatic_cursor_pos()
+    if current_cursor is None or last_programmatic_cursor is None:
+        return False, current_cursor
+
+    dx = abs(current_cursor[0] - last_programmatic_cursor[0])
+    dy = abs(current_cursor[1] - last_programmatic_cursor[1])
+    return dx >= threshold_px or dy >= threshold_px, current_cursor
+
+
+def _update_air_mouse_target(controller, landmark_list, frame_width, frame_height,
+                             screen_width, screen_height, sensitivity, smoothing,
+                             update_interval, min_movement, state):
+    screen_x, screen_y, _, _ = _map_air_mouse_target(
+        landmark_list[8],
+        frame_width,
+        frame_height,
+        screen_width,
+        screen_height,
+        sensitivity,
+    )
+
+    if state["manual_override"]:
+        override_anchor = state["override_anchor"]
+        if override_anchor is None:
+            state["override_anchor"] = (screen_x, screen_y)
+            state["prev_pos"] = controller.get_cursor_pos()
+            return
+
+        finger_delta = max(
+            abs(screen_x - override_anchor[0]),
+            abs(screen_y - override_anchor[1]),
+        )
+        if finger_delta < AIR_MOUSE_REENGAGE_DISTANCE_PX:
+            state["prev_pos"] = controller.get_cursor_pos()
+            return
+
+        state["manual_override"] = False
+        state["override_anchor"] = None
+        current_cursor = controller.get_cursor_pos()
+        state["prev_pos"] = current_cursor
+        controller.adopt_cursor_reference(current_cursor)
+
+    manual_override, current_cursor = _cursor_was_moved_manually(
+        controller,
+        AIR_MOUSE_MANUAL_OVERRIDE_DISTANCE_PX,
+    )
+    if manual_override:
+        state["manual_override"] = True
+        state["override_anchor"] = (screen_x, screen_y)
+        state["prev_pos"] = current_cursor
+        controller.clear_cursor_target()
+        return
+
+    prev_pos = state["prev_pos"]
+    if prev_pos is not None:
+        screen_x = int(screen_x * (1 - smoothing) + prev_pos[0] * smoothing)
+        screen_y = int(screen_y * (1 - smoothing) + prev_pos[1] * smoothing)
+
+    screen_x = max(0, min(screen_width - 1, screen_x))
+    screen_y = max(0, min(screen_height - 1, screen_y))
+
+    now = time.perf_counter()
+    should_update = False
+
+    if prev_pos is None:
+        should_update = True
+    else:
+        time_since_update = now - state["last_update_time"]
+        if time_since_update >= update_interval:
+            dx = abs(screen_x - prev_pos[0])
+            dy = abs(screen_y - prev_pos[1])
+            if dx >= min_movement or dy >= min_movement:
+                should_update = True
+
+    if should_update and controller.move_cursor(screen_x, screen_y):
+        state["prev_pos"] = (screen_x, screen_y)
+        state["last_update_time"] = now
+
+
+_configure_pyautogui()
+
+
+class AutomationController:
+    """Dispatch OS input without blocking gesture or speech processing threads."""
+
+    def __init__(self):
+        self._available = pyautogui is not None
+        self._stop_event = threading.Event()
+        self._action_queue = queue.Queue()
+        self._action_thread = None
+        self._mouse_event = threading.Event()
+        self._mouse_thread = None
+        self._mouse_lock = threading.Lock()
+        self._latest_mouse_pos = None
+        self._cursor_lock = threading.Lock()
+        self._last_programmatic_cursor_pos = None
+        self._user32 = ctypes.windll.user32 if os.name == "nt" else None
+        self._screen_size = self._resolve_screen_size()
+
+    def start(self):
+        if self._action_thread is not None and self._action_thread.is_alive():
+            return
+        self._action_thread = threading.Thread(target=self._action_worker, daemon=True)
+        self._action_thread.start()
+        self._mouse_thread = threading.Thread(target=self._mouse_worker, daemon=True)
+        self._mouse_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._mouse_event.set()
+        try:
+            self._action_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._action_thread is not None and self._action_thread.is_alive():
+            self._action_thread.join(timeout=1.5)
+        if self._mouse_thread is not None and self._mouse_thread.is_alive():
+            self._mouse_thread.join(timeout=1.5)
+
+    def is_available(self):
+        return self._available
+
+    def can_type_text(self):
+        return self._available
+
+    def get_screen_size(self):
+        return self._screen_size
+
+    def get_cursor_pos(self):
+        if self._user32 is not None:
+            try:
+                point = _CursorPoint()
+                if self._user32.GetCursorPos(ctypes.byref(point)):
+                    return int(point.x), int(point.y)
+            except Exception:
+                pass
+        if pyautogui is None:
+            return None
+        try:
+            pos = pyautogui.position()
+            return int(pos.x), int(pos.y)
+        except Exception:
+            return None
+
+    def get_last_programmatic_cursor_pos(self):
+        with self._cursor_lock:
+            return self._last_programmatic_cursor_pos
+
+    def move_cursor(self, x, y):
+        if self._screen_size is None:
+            return False
+        with self._mouse_lock:
+            self._latest_mouse_pos = (int(x), int(y))
+        self._mouse_event.set()
+        return True
+
+    def clear_cursor_target(self):
+        with self._mouse_lock:
+            self._latest_mouse_pos = None
+
+    def adopt_cursor_reference(self, pos=None):
+        if pos is None:
+            pos = self.get_cursor_pos()
+        if pos is None:
+            return
+        with self._cursor_lock:
+            self._last_programmatic_cursor_pos = (int(pos[0]), int(pos[1]))
+
+    def click(self):
+        return self._enqueue(("click",))
+
+    def hotkey(self, *keys):
+        return self._enqueue(("hotkey", keys))
+
+    def press(self, key):
+        return self._enqueue(("press", key))
+
+    def write_text(self, text):
+        if not text:
+            return False
+        return self._enqueue(("write_text", text))
+
+    def _enqueue(self, action):
+        if not self._available:
+            return False
+        try:
+            self._action_queue.put_nowait(action)
+            return True
+        except Exception:
+            return False
+
+    def _resolve_screen_size(self):
+        if self._user32 is not None:
+            try:
+                width = int(self._user32.GetSystemMetrics(0))
+                height = int(self._user32.GetSystemMetrics(1))
+                if width > 0 and height > 0:
+                    return width, height
+            except Exception:
+                pass
+        if pyautogui is None:
+            return None
+        try:
+            return pyautogui.size()
+        except Exception:
+            return None
+
+    def _move_cursor_now(self, x, y):
+        if self._user32 is not None:
+            try:
+                self._user32.SetCursorPos(int(x), int(y))
+                with self._cursor_lock:
+                    self._last_programmatic_cursor_pos = (int(x), int(y))
+                return
+            except Exception:
+                pass
+        if pyautogui is not None:
+            pyautogui.moveTo(int(x), int(y), duration=0.0)
+            with self._cursor_lock:
+                self._last_programmatic_cursor_pos = (int(x), int(y))
+
+    def _mouse_worker(self):
+        while not self._stop_event.is_set():
+            self._mouse_event.wait(0.1)
+            self._mouse_event.clear()
+            if self._stop_event.is_set():
+                break
+            with self._mouse_lock:
+                mouse_pos = self._latest_mouse_pos
+            if mouse_pos is None:
+                continue
+            try:
+                self._move_cursor_now(*mouse_pos)
+            except Exception:
+                pass
+
+    def _action_worker(self):
+        while not self._stop_event.is_set():
+            try:
+                action = self._action_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if action is None:
+                break
+            try:
+                kind = action[0]
+                if kind == "click":
+                    pyautogui.click()
+                elif kind == "hotkey":
+                    pyautogui.hotkey(*action[1])
+                elif kind == "press":
+                    pyautogui.press(action[1])
+                elif kind == "write_text":
+                    pyautogui.write(action[1], interval=0.0)
+            except Exception:
+                pass
+            finally:
+                self._action_queue.task_done()
 
 
 class SpeechDictationController:
-    """Persistent background speech-to-text worker controlled by gestures or tray actions."""
+    """Persistent background speech-to-text worker with push-to-talk control."""
 
-    def __init__(self, model_name="small", sample_rate=16000, chunk_seconds=3.5, language="en"):
-        self.model_name = model_name
-        self._model_dir = self._resolve_model_dir(model_name)
+    def __init__(self, input_controller=None, sample_rate=16000, language="en"):
         self.sample_rate = sample_rate
-        self.chunk_frames = int(sample_rate * chunk_seconds)
         self.language = language
+        self._input_controller = input_controller
+        self._model_path = resource_path("vosk-model-small-en-us")
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -81,8 +449,34 @@ class SpeechDictationController:
         self._last_error = ""
         self._input_device_index = None
         self._input_device_name = "Unavailable"
-        self._available = (sd is not None and WhisperModel is not None and pyautogui is not None)
-        if self._available:
+        self._available = (
+            sd is not None and
+            VoskModel is not None and
+            input_controller is not None and
+            input_controller.can_type_text()
+        )
+        if not self._available:
+            missing_parts = []
+            if sd is None:
+                message = "sounddevice import failed"
+                if SOUNDDEVICE_IMPORT_ERROR is not None:
+                    message = f"{message}: {SOUNDDEVICE_IMPORT_ERROR}"
+                missing_parts.append(message)
+            if VoskModel is None:
+                message = "vosk import failed"
+                if VOSK_IMPORT_ERROR is not None:
+                    message = f"{message}: {VOSK_IMPORT_ERROR}"
+                missing_parts.append(message)
+            if input_controller is None or not input_controller.can_type_text():
+                message = "input automation unavailable"
+                if PYAUTOGUI_IMPORT_ERROR is not None:
+                    message = f"{message}: {PYAUTOGUI_IMPORT_ERROR}"
+                missing_parts.append(message)
+            self._last_error = "; ".join(missing_parts)
+        elif not os.path.isdir(self._model_path):
+            self._available = False
+            self._last_error = f"Speech model not found at {self._model_path}"
+        else:
             self._input_device_index, self._input_device_name = self._resolve_input_device()
             if self._input_device_index is None:
                 self._available = False
@@ -93,6 +487,7 @@ class SpeechDictationController:
             return
         self._thread = threading.Thread(target=self._speech_worker, daemon=True)
         self._thread.start()
+        self._wake_event.set()
 
     def stop(self):
         self._stop_event.set()
@@ -115,11 +510,11 @@ class SpeechDictationController:
             if not self._available:
                 return False
             changed = self._speech_enabled != enabled
+            if not changed:
+                return False
             self._speech_enabled = enabled
             if enabled:
                 self._last_typed_text = ""
-            else:
-                self._model_loading = False
         if not enabled and sd is not None:
             try:
                 sd.stop()
@@ -150,13 +545,18 @@ class SpeechDictationController:
             transcript = self._last_transcript
             last_error = self._last_error
             model_loading = self._model_loading
+            model_loaded = self._model is not None
             input_device_name = self._input_device_name
         if not available:
             status = "Speech: Unavailable"
         elif model_loading:
             status = "Speech: Loading..."
+        elif enabled:
+            status = "Speech: Listening"
+        elif model_loaded:
+            status = "Speech: Ready"
         else:
-            status = f"Speech: {'ON' if enabled else 'OFF'}"
+            status = "Speech: Starting..."
         if last_error:
             status = f"{status} ({last_error})"
         return {
@@ -197,84 +597,21 @@ class SpeechDictationController:
             self._set_runtime_error(exc)
         return None, "Unavailable"
 
-    @staticmethod
-    def _resolve_model_dir(model_name):
-        """Return the local model directory (EXE) or None (script uses HF cache)."""
-        if not getattr(sys, 'frozen', False):
-            return None  # script mode: faster-whisper resolves via HuggingFace cache
-        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-        return os.path.join(appdata, "HandGestureApp", "models", f"whisper-{model_name}")
-
-    def _is_model_ready(self):
-        """Return True if the model is available locally (or we are in script mode)."""
-        if self._model_dir is None:
-            return True  # script mode — let faster-whisper handle it
-        required = ["model.bin", "config.json"]
-        return os.path.isdir(self._model_dir) and all(
-            os.path.isfile(os.path.join(self._model_dir, f)) for f in required
-        )
-
-    def download_model(self):
-        """Download the Whisper model from HuggingFace into the local app data folder.
-
-        Call this once before first use in EXE mode (e.g. from an installer or
-        a one-time setup dialog). Not called automatically.
-        """
-        if self._model_dir is None:
-            return  # nothing to do in script mode
-        try:
-            from huggingface_hub import snapshot_download
-            os.makedirs(self._model_dir, exist_ok=True)
-            snapshot_download(
-                repo_id=f"Systran/faster-whisper-{self.model_name}",
-                local_dir=self._model_dir,
-            )
-        except Exception as exc:
-            self._set_runtime_error(exc)
-
     def _load_model(self):
         with self._lock:
             if self._model is not None:
                 return self._model
             self._model_loading = True
             self._last_error = ""
-
-        if not self._is_model_ready():
+        try:
+            model = VoskModel(self._model_path)
+        except Exception as exc:
             with self._lock:
                 self._available = False
                 self._model_loading = False
                 self._speech_enabled = False
-                self._last_error = "Speech model not downloaded"
-            print("[speech] Speech model not downloaded. Call download_model() first.", file=sys.stderr)
-            return None
-
-        # In EXE mode use the local folder path; in script mode use the model name
-        # so faster-whisper resolves it via the HuggingFace cache as normal.
-        model_source = self._model_dir if self._model_dir is not None else self.model_name
-
-        model = None
-        load_error = None
-        load_attempts = (
-            {"device": "cpu", "compute_type": "int8"},
-            {"device": "cpu", "compute_type": "float32"},
-        )
-        for attempt in load_attempts:
-            try:
-                model = WhisperModel(
-                    model_source,
-                    device=attempt["device"],
-                    compute_type=attempt["compute_type"],
-                )
-                break
-            except Exception as exc:
-                load_error = exc
-        if model is None:
-            with self._lock:
-                self._available = False
-                self._model_loading = False
-                self._speech_enabled = False
-                self._last_error = f"{load_error.__class__.__name__}: {load_error}"
-            print(f"[speech] {load_error.__class__.__name__}: {load_error}", file=sys.stderr)
+                self._last_error = f"{exc.__class__.__name__}: {exc}"
+            print(f"[speech] {exc.__class__.__name__}: {exc}", file=sys.stderr)
             return None
         with self._lock:
             self._model = model
@@ -282,101 +619,90 @@ class SpeechDictationController:
         return model
 
     def _speech_worker(self):
-        silence_threshold = 0.01
-
         while not self._stop_event.is_set():
             with self._lock:
                 available = self._available
                 enabled = self._speech_enabled
+                model = self._model
 
             if not available:
                 self._wake_event.wait(0.25)
                 self._wake_event.clear()
                 continue
 
+            if model is None:
+                model = self._load_model()
+                if model is None:
+                    self._wake_event.wait(0.25)
+                    self._wake_event.clear()
+                    continue
+
             if not enabled:
                 self._wake_event.wait(0.1)
                 self._wake_event.clear()
                 continue
 
-            model = self._model if self._model is not None else self._load_model()
-            if model is None:
-                self._wake_event.wait(0.25)
-                self._wake_event.clear()
-                continue
-
             try:
-                audio = sd.rec(
-                    self.chunk_frames,
+                rec = KaldiRecognizer(model, self.sample_rate)
+                with sd.RawInputStream(
                     samplerate=self.sample_rate,
+                    blocksize=4000,
+                    dtype="int16",
                     channels=1,
-                    dtype="float32",
                     device=self._input_device_index,
-                )
-                sd.wait()
+                ) as stream:
+                    while not self._stop_event.is_set():
+                        with self._lock:
+                            enabled = self._speech_enabled
+                        if not enabled:
+                            break
+                        data, _ = stream.read(4000)
+                        if rec.AcceptWaveform(bytes(data)):
+                            result = json.loads(rec.Result())
+                            text = result.get("text", "").strip()
+                            if not text:
+                                continue
+                            normalized = " ".join(text.split())
+                            with self._lock:
+                                self._last_transcript = normalized
+                                already_typed = normalized == self._last_typed_text
+                            if already_typed:
+                                continue
+                            if not self._input_controller.write_text(normalized + " "):
+                                self._set_runtime_error(RuntimeError("Unable to queue dictated text"))
+                                continue
+                            with self._lock:
+                                self._last_typed_text = normalized
             except Exception as exc:
                 self._set_runtime_error(exc)
                 self._wake_event.wait(0.25)
                 self._wake_event.clear()
-                continue
-
-            if self._stop_event.is_set():
-                break
-
-            with self._lock:
-                enabled = self._speech_enabled
-                self._last_error = ""
-
-            if not enabled:
-                continue
-
-            audio = np.squeeze(audio)
-            if audio.size == 0 or float(np.max(np.abs(audio))) < silence_threshold:
-                continue
-
-            try:
-                segments, _ = model.transcribe(
-                    audio,
-                    language=self.language,
-                    beam_size=5,
-                    vad_filter=True,
-                    condition_on_previous_text=False,
-                )
-                text = " ".join(segment.text.strip() for segment in segments).strip()
-            except Exception as exc:
-                self._set_runtime_error(exc)
-                continue
-
-            normalized_text = " ".join(text.split())
-            if not normalized_text:
-                continue
-
-            with self._lock:
-                self._last_transcript = normalized_text
-                if normalized_text == self._last_typed_text:
-                    continue
-
-            try:
-                pyautogui.write(normalized_text + " ", interval=0.0)
-            except Exception as exc:
-                self._set_runtime_error(exc)
-                continue
-
-            with self._lock:
-                self._last_typed_text = normalized_text
 
 
-def handle_speech_gesture(hand_sign_id, hand_sign_label, now, open_label_index, close_label_index,
-                          speech_controller, can_activate_gesture):
-    """Use Open to enable dictation and Close to disable it, reusing gesture hold/cooldown logic."""
+def update_push_to_talk(close_hand_detected, speech_controller):
+    """Enable speech only while the close-hand push-to-talk gesture is actively held."""
     if speech_controller is None or not speech_controller.is_available():
         return
-    if open_label_index is not None and hand_sign_id == open_label_index:
-        if can_activate_gesture(hand_sign_label, now):
-            speech_controller.set_enabled(True)
-    elif close_label_index is not None and hand_sign_id == close_label_index:
-        if can_activate_gesture(hand_sign_label, now):
-            speech_controller.set_enabled(False)
+    speech_controller.set_enabled(close_hand_detected)
+
+
+def _get_label_index(labels, name):
+    try:
+        return labels.index(name)
+    except ValueError:
+        return None
+
+
+def _load_classifier_labels(base_path):
+    with open(os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier_label.csv'),
+              encoding='utf-8-sig') as f:
+        keypoint_classifier_labels = [row[0] for row in csv.reader(f)]
+
+    with open(os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier_label.csv'),
+              encoding='utf-8-sig') as f:
+        point_history_classifier_labels = [row[0] for row in csv.reader(f)]
+
+    return keypoint_classifier_labels, point_history_classifier_labels
 
 
 def get_args():
@@ -398,7 +724,7 @@ def get_args():
                         default=0.7)
     parser.add_argument("--min_tracking_confidence",
                         help='min_tracking_confidence',
-                        type=int,
+                        type=float,
                         default=0.5)
     parser.add_argument("--enable_air_mouse",
                         help='Enable air mouse control when Pointer gesture is detected',
@@ -412,7 +738,7 @@ def get_args():
                         type=float,
                         default=0.85)
     parser.add_argument("--high_performance",
-                        help='Enable high-performance mode (uses more CPU/GPU resources)',
+                        help='Enable high-performance mode (higher capture/display rate and lower camera latency)',
                         action='store_true',
                         default=True)
     parser.add_argument("--no_high_performance",
@@ -420,9 +746,14 @@ def get_args():
                         action='store_false',
                         dest='high_performance')
     parser.add_argument("--num_threads",
-                        help='Number of threads for TensorFlow Lite (default: 8 in high-performance, 1 otherwise)',
+                        help='Number of threads for the TFLite gesture classifiers (default: 1)',
                         type=int,
                         default=None)
+    parser.add_argument("--model_complexity",
+                        help='MediaPipe Hands model complexity: 0=lite/faster, 1=full (default: 1)',
+                        type=int,
+                        default=1,
+                        choices=[0, 1])
     parser.add_argument("--mouse_update_rate",
                         help='Mouse update rate in Hz (higher = smoother but more CPU, default: 120)',
                         type=int,
@@ -471,23 +802,24 @@ def main_new_ui(args):
     from Overlay import OverlayWindow
     from Tray import TrayIcon
 
-    speech_controller = SpeechDictationController()
+    automation_controller = AutomationController()
+    automation_controller.start()
+    speech_controller = SpeechDictationController(input_controller=automation_controller)
     speech_controller.start()
+    processing_target_fps = 60 if args.high_performance else 30
     
     # Initialize MediaPipe and classifiers
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=args.use_static_image_mode,
         max_num_hands=2,
+        model_complexity=args.model_complexity,
         min_detection_confidence=args.min_detection_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
     )
     
     # Determine number of threads for TensorFlow Lite
-    if args.high_performance:
-        num_threads = args.num_threads if args.num_threads is not None else 8
-    else:
-        num_threads = args.num_threads if args.num_threads is not None else 1
+    num_threads = args.num_threads if args.num_threads is not None else _default_classifier_threads()
 
     base_path = get_base_path()
     keypoint_model = os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier.tflite')
@@ -496,33 +828,19 @@ def main_new_ui(args):
     point_history_classifier = PointHistoryClassifier(model_path=point_history_model, num_threads=num_threads)
 
     # Read labels
-    with open(os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier_label.csv'),
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [row[0] for row in keypoint_classifier_labels]
-
-    with open(os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier_label.csv'),
-              encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [row[0] for row in point_history_classifier_labels]
+    keypoint_classifier_labels, point_history_classifier_labels = _load_classifier_labels(base_path)
 
     # Resolve label indices for hand signs
-    def get_label_index(labels, name):
-        try:
-            return labels.index(name)
-        except ValueError:
-            return None
-    
-    open_label_index = get_label_index(keypoint_classifier_labels, 'Open')
-    close_label_index = get_label_index(keypoint_classifier_labels, 'Close')
-    ok_label_index = get_label_index(keypoint_classifier_labels, 'OK')
-    thumbs_up_label_index = get_label_index(keypoint_classifier_labels, 'Thumbs Up')
-    thumbs_down_label_index = get_label_index(keypoint_classifier_labels, 'Thumbs Down')
-    two_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Two Fingers Up')
-    three_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Three Fingers Up')
-    four_fingers_up_label_index = get_label_index(keypoint_classifier_labels, 'Four Fingers Up')
-    pointer_label_index = get_label_index(keypoint_classifier_labels, 'Pointer')
-    pinch_label_index = get_label_index(keypoint_classifier_labels, 'Pinch')
+    open_label_index = _get_label_index(keypoint_classifier_labels, 'Open')
+    close_label_index = _get_label_index(keypoint_classifier_labels, 'Close')
+    ok_label_index = _get_label_index(keypoint_classifier_labels, 'OK')
+    thumbs_up_label_index = _get_label_index(keypoint_classifier_labels, 'Thumbs Up')
+    thumbs_down_label_index = _get_label_index(keypoint_classifier_labels, 'Thumbs Down')
+    two_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Two Fingers Up')
+    three_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Three Fingers Up')
+    four_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Four Fingers Up')
+    pointer_label_index = _get_label_index(keypoint_classifier_labels, 'Pointer')
+    pinch_label_index = _get_label_index(keypoint_classifier_labels, 'Pinch')
     
     # Initialize volume control if available
     volume_interface = None
@@ -543,21 +861,24 @@ def main_new_ui(args):
     # Air mouse control variables
     mouse_sensitivity = args.mouse_sensitivity
     mouse_smoothing = max(0.0, min(0.99, args.mouse_smoothing))
-    prev_mouse_pos = [None]  # Use list to allow mutation in nested function
+    air_mouse_state = {
+        "prev_pos": None,
+        "last_update_time": 0.0,
+        "manual_override": False,
+        "override_anchor": None,
+    }
     
     # Cache screen size
-    screen_width, screen_height = None, None
-    if pyautogui is not None:
-        screen_width, screen_height = pyautogui.size()
+    screen_size = automation_controller.get_screen_size()
+    if screen_size is None:
+        screen_width, screen_height = None, None
+    else:
+        screen_width, screen_height = screen_size
     
     # Mouse movement throttling
     mouse_update_interval = 1.0 / args.mouse_update_rate
     min_mouse_movement = args.min_mouse_movement
-    last_mouse_update_time = [0.0]
     
-    # Debounce for hotkey actions
-    last_hotkey_time = [0.0]
-    hotkey_cooldown_sec = 1.5
     # Debounce for pinch clicks
     last_pinch_click_time = [0.0]
     pinch_click_cooldown_sec = 1.0
@@ -597,7 +918,13 @@ def main_new_ui(args):
     app = QApplication(sys.argv)
     
     # Create the overlay window
-    overlay = OverlayWindow()
+    detector = GestureDetector(
+        camera_index=args.device,
+        frame_width=args.width,
+        frame_height=args.height,
+        target_fps=processing_target_fps,
+    )
+    overlay = OverlayWindow(detector=detector)
     overlay.set_speech_controller(speech_controller)
     
     # Create the tray icon (owns gesture_hand / mouse_enabled state)
@@ -612,6 +939,8 @@ def main_new_ui(args):
     current_gesture = ["Gesture: (awaiting detection...)"]
     last_gesture_label = {}  # Track previous gesture per hand to detect changes
     processing_stop_event = threading.Event()
+    automation_available = automation_controller.is_available()
+    frame_sequence = [None]
     
 
     # Single camera read per tick: worker drives frame + gesture; overlay only displays.
@@ -619,19 +948,26 @@ def main_new_ui(args):
 
     def process_frame_loop():
         """Process frames on a worker thread and publish the latest frame to the overlay."""
-        target_interval = 1.0 / 30.0
+        target_interval = 1.0 / processing_target_fps
 
         while not processing_stop_event.is_set():
             loop_started = time.perf_counter()
-            frame = overlay.detector.get_frame()
+            frame_sequence[0], frame = overlay.detector.get_latest_frame(
+                previous_sequence=frame_sequence[0],
+                timeout=max(0.05, target_interval * 2.0),
+            )
             if frame is None:
                 processing_stop_event.wait(0.01)
                 continue
+
+            speech_push_to_talk_active = False
+            frame_height, frame_width = frame.shape[:2]
 
             image_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
             image_rgb.flags.writeable = False
             results = hands.process(image_rgb)
             image_rgb.flags.writeable = True
+            mouse_tracking_active_this_frame = False
 
             if results.multi_hand_landmarks is not None:
                 for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
@@ -653,61 +989,35 @@ def main_new_ui(args):
                     is_mouse_hand = (hand_label == tray.mouse_hand) and tray.mouse_enabled
                     is_pointer_gesture = (pointer_label_index is not None and hand_sign_id == pointer_label_index)
                     is_pinch_gesture = (pinch_label_index is not None and hand_sign_id == pinch_label_index)
+                    is_close_gesture = (close_label_index is not None and hand_sign_id == close_label_index)
                     is_mouse_move_gesture = is_pointer_gesture and is_mouse_hand
+                    if is_gesture_hand and is_close_gesture:
+                        speech_push_to_talk_active = True
                     if is_pointer_gesture or is_pinch_gesture:
                         point_history.append(landmark_list[8])
                     else:
                         point_history.append([0, 0])
 
                     if is_mouse_move_gesture:
-                        if pyautogui is not None:
-                            cap_width = frame.shape[1]
-                            cap_height = frame.shape[0]
-                            index_finger_tip = landmark_list[8]
+                        if screen_width is not None and screen_height is not None:
+                            _update_air_mouse_target(
+                                automation_controller,
+                                landmark_list,
+                                frame_width,
+                                frame_height,
+                                screen_width,
+                                screen_height,
+                                mouse_sensitivity,
+                                mouse_smoothing,
+                                mouse_update_interval,
+                                min_mouse_movement,
+                                air_mouse_state,
+                            )
+                            mouse_tracking_active_this_frame = True
 
-                            normalized_x = index_finger_tip[0] / cap_width
-                            normalized_y = index_finger_tip[1] / cap_height
+                    now = time.perf_counter()
 
-                            effective_x = (normalized_x - 0.5) * mouse_sensitivity + 0.5
-                            effective_y = (normalized_y - 0.5) * mouse_sensitivity + 0.5
-                            effective_x = max(0.0, min(1.0, effective_x))
-                            effective_y = max(0.0, min(1.0, effective_y))
-
-                            screen_x = int(effective_x * screen_width)
-                            screen_y = int(effective_y * screen_height)
-
-                            if prev_mouse_pos[0] is not None:
-                                screen_x = int(screen_x * (1 - mouse_smoothing) + prev_mouse_pos[0][0] * mouse_smoothing)
-                                screen_y = int(screen_y * (1 - mouse_smoothing) + prev_mouse_pos[0][1] * mouse_smoothing)
-
-                            screen_x = max(0, min(screen_width - 1, screen_x))
-                            screen_y = max(0, min(screen_height - 1, screen_y))
-
-                            now = time.time()
-                            should_update = False
-
-                            if prev_mouse_pos[0] is None:
-                                should_update = True
-                            else:
-                                time_since_update = now - last_mouse_update_time[0]
-                                if time_since_update >= mouse_update_interval:
-                                    dx = abs(screen_x - prev_mouse_pos[0][0])
-                                    dy = abs(screen_y - prev_mouse_pos[0][1])
-                                    if dx >= min_mouse_movement or dy >= min_mouse_movement:
-                                        should_update = True
-
-                            if should_update:
-                                try:
-                                    pyautogui.moveTo(screen_x, screen_y, duration=0.0)
-                                    prev_mouse_pos[0] = (screen_x, screen_y)
-                                    last_mouse_update_time[0] = now
-                                except Exception:
-                                    pass
-                    else:
-                        prev_mouse_pos[0] = None
-
-                    if pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                        now = time.time()
+                    if automation_available and is_gesture_hand and is_pinch_gesture:
                         if can_activate_gesture(
                             hand_sign_label,
                             now,
@@ -715,48 +1025,26 @@ def main_new_ui(args):
                             cooldown_sec=pinch_click_cooldown_sec,
                         ) and now - last_pinch_click_time[0] >= pinch_click_cooldown_sec:
                             try:
-                                pyautogui.click()
+                                automation_controller.click()
                                 last_pinch_click_time[0] = now
                             except Exception:
                                 pass
 
-                    if pyautogui is not None and is_gesture_hand:
-                        now = time.time()
-                        if open_label_index is not None and hand_sign_id == open_label_index:
-                            handle_speech_gesture(
-                                hand_sign_id,
-                                hand_sign_label,
-                                now,
-                                open_label_index,
-                                close_label_index,
-                                speech_controller,
-                                can_activate_gesture,
-                            )
-                        elif close_label_index is not None and hand_sign_id == close_label_index:
-                            handle_speech_gesture(
-                                hand_sign_id,
-                                hand_sign_label,
-                                now,
-                                open_label_index,
-                                close_label_index,
-                                speech_controller,
-                                can_activate_gesture,
-                            )
-                        elif ok_label_index is not None and hand_sign_id == ok_label_index:
+                    if automation_available and is_gesture_hand:
+                        if ok_label_index is not None and hand_sign_id == ok_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
-                                    pyautogui.hotkey('ctrl', 't')
+                                    automation_controller.hotkey('ctrl', 't')
                                 except Exception:
                                     pass
                         elif four_fingers_up_label_index is not None and hand_sign_id == four_fingers_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
-                                    pyautogui.hotkey('ctrl', 'w')
+                                    automation_controller.hotkey('ctrl', 'w')
                                 except Exception:
                                     pass
 
                     if volume_interface is not None and is_gesture_hand:
-                        now = time.time()
                         if thumbs_up_label_index is not None and hand_sign_id == thumbs_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
@@ -774,18 +1062,17 @@ def main_new_ui(args):
                                 except Exception:
                                     pass
 
-                    if pyautogui is not None and is_gesture_hand:
-                        now = time.time()
+                    if automation_available and is_gesture_hand:
                         if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
-                                    pyautogui.press('playpause')
+                                    automation_controller.press('playpause')
                                 except Exception:
                                     pass
                         elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
                             if can_activate_gesture(hand_sign_label, now):
                                 try:
-                                    pyautogui.hotkey('alt', 'left')
+                                    automation_controller.hotkey('alt', 'left')
                                 except Exception:
                                     pass
 
@@ -795,10 +1082,10 @@ def main_new_ui(args):
                         finger_gesture_id = point_history_classifier(pre_processed_point_history_list)
 
                     finger_gesture_history.append(finger_gesture_id)
-                    most_common_fg_id = Counter(finger_gesture_history).most_common()
+                    most_common_fg_id = Counter(finger_gesture_history).most_common(1)
 
                     handedness_label = handedness.classification[0].label
-                    finger_gesture_label = point_history_classifier_labels[most_common_fg_id[0][0]]
+                    finger_gesture_label = point_history_classifier_labels[most_common_fg_id[0][0]] if most_common_fg_id else ""
                     current_gesture[0] = f"{handedness_label}: {hand_sign_label}"
                     if finger_gesture_label:
                         current_gesture[0] += f" | {finger_gesture_label}"
@@ -806,6 +1093,10 @@ def main_new_ui(args):
                 point_history.append([0, 0])
                 current_gesture[0] = "Gesture: (no hand detected)"
 
+            if not mouse_tracking_active_this_frame:
+                _reset_air_mouse_state(air_mouse_state, automation_controller)
+
+            update_push_to_talk(speech_push_to_talk_active, speech_controller)
             overlay.set_camera_frame(frame)
             overlay.set_gesture_label(current_gesture[0])
 
@@ -820,7 +1111,7 @@ def main_new_ui(args):
     display_timer = QTimer()
     display_timer.setTimerType(Qt.PreciseTimer)
     display_timer.timeout.connect(overlay.update_frame)
-    display_timer.start(33)
+    display_timer.start(16 if args.high_performance else 33)
 
     def shutdown():
         processing_stop_event.set()
@@ -836,6 +1127,10 @@ def main_new_ui(args):
             pass
         try:
             speech_controller.stop()
+        except Exception:
+            pass
+        try:
+            automation_controller.stop()
         except Exception:
             pass
         close_method = getattr(hands, 'close', None)
@@ -859,7 +1154,9 @@ def main_new_ui(args):
 
 def main_old_ui(args):
     """Run the original OpenCV window UI with gesture recognition."""
-    speech_controller = SpeechDictationController()
+    automation_controller = AutomationController()
+    automation_controller.start()
+    speech_controller = SpeechDictationController(input_controller=automation_controller)
     speech_controller.start()
 
     cap_device = args.device
@@ -873,24 +1170,25 @@ def main_old_ui(args):
     use_brect = True
 
     # Camera preparation ###############################################################
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+    detector = GestureDetector(
+        camera_index=cap_device,
+        frame_width=cap_width,
+        frame_height=cap_height,
+        target_fps=60 if args.high_performance else 30,
+    )
 
     # Model load #############################################################
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
         max_num_hands=2,
+        model_complexity=args.model_complexity,
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
 
     # Determine number of threads for TensorFlow Lite
-    if args.high_performance:
-        num_threads = args.num_threads if args.num_threads is not None else 8
-    else:
-        num_threads = args.num_threads if args.num_threads is not None else 1
+    num_threads = args.num_threads if args.num_threads is not None else _default_classifier_threads()
 
     base_path = get_base_path()
     keypoint_model = os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier.tflite')
@@ -899,64 +1197,18 @@ def main_old_ui(args):
     point_history_classifier = PointHistoryClassifier(model_path=point_history_model, num_threads=num_threads)
 
     # Read labels ###########################################################
-    with open(os.path.join(base_path, 'model', 'keypoint_classifier', 'keypoint_classifier_label.csv'),
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [
-            row[0] for row in keypoint_classifier_labels
-        ]
-    with open(os.path.join(base_path, 'model', 'point_history_classifier', 'point_history_classifier_label.csv'),
-              encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [
-            row[0] for row in point_history_classifier_labels
-        ]
+    keypoint_classifier_labels, point_history_classifier_labels = _load_classifier_labels(base_path)
 
     # Resolve label indices for hand signs (if present)
-    try:
-        open_label_index = keypoint_classifier_labels.index('Open')
-    except ValueError:
-        open_label_index = None
-    
-    try:
-        close_label_index = keypoint_classifier_labels.index('Close')
-    except ValueError:
-        close_label_index = None
-    
-    try:
-        ok_label_index = keypoint_classifier_labels.index('OK')
-    except ValueError:
-        ok_label_index = None
-
-    try:
-        thumbs_up_label_index = keypoint_classifier_labels.index('Thumbs Up')
-    except ValueError:
-        thumbs_up_label_index = None
-    
-    try:
-        thumbs_down_label_index = keypoint_classifier_labels.index('Thumbs Down')
-    except ValueError:
-        thumbs_down_label_index = None
-
-    try:
-        two_fingers_up_label_index = keypoint_classifier_labels.index('Two Fingers Up')
-    except ValueError:
-        two_fingers_up_label_index = None
-
-    try:
-        three_fingers_up_label_index = keypoint_classifier_labels.index('Three Fingers Up')
-    except ValueError:
-        three_fingers_up_label_index = None
-
-    try:
-        four_fingers_up_label_index = keypoint_classifier_labels.index('Four Fingers Up')
-    except ValueError:
-        four_fingers_up_label_index = None
-
-    try:
-        pinch_label_index = keypoint_classifier_labels.index('Pinch')
-    except ValueError:
-        pinch_label_index = None
+    open_label_index = _get_label_index(keypoint_classifier_labels, 'Open')
+    close_label_index = _get_label_index(keypoint_classifier_labels, 'Close')
+    ok_label_index = _get_label_index(keypoint_classifier_labels, 'OK')
+    thumbs_up_label_index = _get_label_index(keypoint_classifier_labels, 'Thumbs Up')
+    thumbs_down_label_index = _get_label_index(keypoint_classifier_labels, 'Thumbs Down')
+    two_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Two Fingers Up')
+    three_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Three Fingers Up')
+    four_fingers_up_label_index = _get_label_index(keypoint_classifier_labels, 'Four Fingers Up')
+    pinch_label_index = _get_label_index(keypoint_classifier_labels, 'Pinch')
 
     # Hand assignment: mouse hand = Pointer (cursor movement); gesture hand = all other gestures including Pinch (left click)
     gesture_hand_label = args.gesturehand.capitalize()   # "Left" or "Right"
@@ -988,9 +1240,6 @@ def main_old_ui(args):
     #  ########################################################################
     mode = 0
 
-    # Debounce for hotkey actions
-    last_hotkey_time = 0.0
-    hotkey_cooldown_sec = 1.5
     # Debounce for pinch clicks
     last_pinch_click_time = 0.0
     pinch_click_cooldown_sec = 1.0
@@ -1031,49 +1280,25 @@ def main_old_ui(args):
     enable_air_mouse = True  # Always enabled
     mouse_sensitivity = args.mouse_sensitivity
     mouse_smoothing = max(0.0, min(0.99, args.mouse_smoothing))  # Clamp to avoid div/edge issues
-    prev_mouse_pos = None
-    pointer_label_index = None
-    try:
-        pointer_label_index = keypoint_classifier_labels.index('Pointer')
-    except ValueError:
-        pointer_label_index = None
+    air_mouse_state = {
+        "prev_pos": None,
+        "last_update_time": 0.0,
+        "manual_override": False,
+        "override_anchor": None,
+    }
+    pointer_label_index = _get_label_index(keypoint_classifier_labels, 'Pointer')
     
     # Performance optimization: Cache screen size
-    screen_width, screen_height = None, None
-    if pyautogui is not None:
-        screen_width, screen_height = pyautogui.size()
+    screen_size = automation_controller.get_screen_size()
+    if screen_size is None:
+        screen_width, screen_height = None, None
+    else:
+        screen_width, screen_height = screen_size
     
     # Mouse movement throttling
     mouse_update_rate = args.mouse_update_rate
     min_mouse_movement = args.min_mouse_movement
     mouse_update_interval = 1.0 / mouse_update_rate
-    last_mouse_update_time = 0.0
-    
-    # Thread-safe mouse movement queue for high-performance mode (Event + sentinel for clean shutdown)
-    mouse_queue = queue.Queue(maxsize=1) if args.high_performance and pyautogui else None
-    mouse_stop_event = threading.Event() if (args.high_performance and pyautogui) else None
-    _MOUSE_SENTINEL = object()  # unique sentinel to signal worker to exit
-
-    def mouse_worker():
-        """Background thread for mouse movement; exits when sentinel is received or stop event is set."""
-        while not mouse_stop_event.is_set():
-            try:
-                item = mouse_queue.get(timeout=0.1)
-                if item is _MOUSE_SENTINEL:
-                    mouse_queue.task_done()
-                    break
-                x, y = item
-                pyautogui.moveTo(x, y, duration=0.0)
-                mouse_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception:
-                pass
-
-    # Start mouse worker thread if in high-performance mode
-    if mouse_queue is not None and mouse_stop_event is not None:
-        mouse_thread = threading.Thread(target=mouse_worker, daemon=True)
-        mouse_thread.start()
     
     # Drawing quality settings
     draw_quality = args.draw_quality
@@ -1083,6 +1308,8 @@ def main_old_ui(args):
     
     # Track previous gesture per hand to detect changes
     last_gesture_label = {}
+    automation_available = automation_controller.is_available()
+    frame_sequence = None
 
     while True:
         fps = cvFpsCalc.get()
@@ -1094,10 +1321,9 @@ def main_old_ui(args):
         number, mode = select_mode(key, mode)
 
         # Camera capture #####################################################
-        ret, image = cap.read()
-        if not ret:
-            break
-        image = cv.flip(image, 1)  # Mirror display
+        frame_sequence, image = detector.get_latest_frame(previous_sequence=frame_sequence, timeout=0.1)
+        if image is None:
+            continue
         # Performance: Use .copy() instead of deepcopy (much faster for 2D arrays)
         debug_image = image.copy()
 
@@ -1107,15 +1333,15 @@ def main_old_ui(args):
         image.flags.writeable = False
         results = hands.process(image)
         image.flags.writeable = True
+        speech_push_to_talk_active = False
+        mouse_tracking_active_this_frame = False
 
         #  ####################################################################
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
                                                   results.multi_handedness):
-                # Bounding box calculation
-                brect = calc_bounding_rect(debug_image, hand_landmarks)
-                # Landmark calculation
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
+                brect = calc_bounding_rect(debug_image, landmark_list)
 
                 # Conversion to relative coordinates / normalized coordinates
                 pre_processed_landmark_list = pre_process_landmark(
@@ -1143,8 +1369,12 @@ def main_old_ui(args):
                                      hand_sign_id == pointer_label_index)
                 is_pinch_gesture = (pinch_label_index is not None and 
                                     hand_sign_id == pinch_label_index)
+                is_close_gesture = (close_label_index is not None and
+                                    hand_sign_id == close_label_index)
                 # Cursor movement: only Pointer gesture on the mouse hand
                 is_mouse_move_gesture = is_pointer_gesture and is_mouse_hand
+                if is_gesture_hand and is_close_gesture and mode == 0:
+                    speech_push_to_talk_active = True
                 if is_pointer_gesture or is_pinch_gesture:
                     point_history.append(landmark_list[8])
                 else:
@@ -1152,74 +1382,26 @@ def main_old_ui(args):
                 
                 if is_mouse_move_gesture:  # Pointer on mouse hand = move cursor
                     # Air mouse control (optimized for performance)
-                    if enable_air_mouse and pyautogui is not None and mode == 0:
-                        index_finger_tip = landmark_list[8]  # Index finger tip coordinates
-                        
-                        # Map camera coordinates to screen coordinates (full camera range -> full screen)
-                        # Normalize to 0-1 range based on camera frame
-                        normalized_x = index_finger_tip[0] / cap_width
-                        normalized_y = index_finger_tip[1] / cap_height
-                        
-                        # Convert to screen coordinates with sensitivity as gain (not range shrink)
-                        # Sensitivity: 1.0 = 1:1 mapping; >1.0 = more sensitive (small hand move = big cursor move)
-                        # Full camera range (0-1) always maps to full screen; clamp keeps cursor on screen
-                        effective_x = (normalized_x - 0.5) * mouse_sensitivity + 0.5
-                        effective_y = (normalized_y - 0.5) * mouse_sensitivity + 0.5
-                        effective_x = max(0.0, min(1.0, effective_x))
-                        effective_y = max(0.0, min(1.0, effective_y))
-                        
-                        screen_x = int(effective_x * screen_width)
-                        screen_y = int(effective_y * screen_height)
-                        
-                        # Smooth movement using previous position (slower = higher smoothing)
-                        if prev_mouse_pos is not None:
-                            screen_x = int(screen_x * (1 - mouse_smoothing) + prev_mouse_pos[0] * mouse_smoothing)
-                            screen_y = int(screen_y * (1 - mouse_smoothing) + prev_mouse_pos[1] * mouse_smoothing)
-                        
-                        # Clamp to screen bounds
-                        screen_x = max(0, min(screen_width - 1, screen_x))
-                        screen_y = max(0, min(screen_height - 1, screen_y))
-                        
-                        # Performance optimization: Throttle mouse updates
-                        now = time.time()
-                        should_update = False
-                        
-                        if prev_mouse_pos is None:
-                            # First update, always move
-                            should_update = True
-                        else:
-                            # Check if enough time has passed (rate limiting)
-                            time_since_update = now - last_mouse_update_time
-                            if time_since_update >= mouse_update_interval:
-                                # Check if movement is significant enough
-                                dx = abs(screen_x - prev_mouse_pos[0])
-                                dy = abs(screen_y - prev_mouse_pos[1])
-                                if dx >= min_mouse_movement or dy >= min_mouse_movement:
-                                    should_update = True
-                        
-                        if should_update:
-                            try:
-                                if mouse_queue is not None:
-                                    # High-performance mode: non-blocking queue
-                                    try:
-                                        mouse_queue.put_nowait((screen_x, screen_y))
-                                    except queue.Full:
-                                        # Skip if queue is full (prevents lag buildup)
-                                        pass
-                                else:
-                                    # Normal mode: direct call
-                                    pyautogui.moveTo(screen_x, screen_y, duration=0.0)
-                                prev_mouse_pos = (screen_x, screen_y)
-                                last_mouse_update_time = now
-                            except Exception:
-                                pass
-                else:
-                    # Reset previous mouse position when not in pointer (move) mode
-                    prev_mouse_pos = None
+                    if enable_air_mouse and screen_width is not None and screen_height is not None and mode == 0:
+                        _update_air_mouse_target(
+                            automation_controller,
+                            landmark_list,
+                            cap_width,
+                            cap_height,
+                            screen_width,
+                            screen_height,
+                            mouse_sensitivity,
+                            mouse_smoothing,
+                            mouse_update_interval,
+                            min_mouse_movement,
+                            air_mouse_state,
+                        )
+                        mouse_tracking_active_this_frame = True
+
+                now = time.perf_counter()
 
                 # Pinch on gesture hand = left click after a short hold
-                if mode == 0 and pyautogui is not None and is_gesture_hand and is_pinch_gesture:
-                    now = time.time()
+                if mode == 0 and automation_available and is_gesture_hand and is_pinch_gesture:
                     if can_activate_gesture(
                         hand_sign_label,
                         now,
@@ -1227,7 +1409,7 @@ def main_old_ui(args):
                         cooldown_sec=pinch_click_cooldown_sec,
                     ) and now - last_pinch_click_time >= pinch_click_cooldown_sec:
                         try:
-                            pyautogui.click()
+                            automation_controller.click()
                             last_pinch_click_time = now
                         except Exception:
                             pass
@@ -1236,38 +1418,13 @@ def main_old_ui(args):
                 # - Only when not in logging modes (mode == 0)
                 # - Per-gesture cooldown to avoid repeated triggers
                 # - Requires pyautogui to be available
-                if mode == 0 and pyautogui is not None and is_gesture_hand:
-                    now = time.time()
-                    # Open hand -> enable speech dictation
-                    if (open_label_index is not None and
-                            hand_sign_id == open_label_index):
-                        handle_speech_gesture(
-                            hand_sign_id,
-                            hand_sign_label,
-                            now,
-                            open_label_index,
-                            close_label_index,
-                            speech_controller,
-                            can_activate_gesture,
-                        )
-                    # Close hand -> disable speech dictation
-                    elif (close_label_index is not None and
-                            hand_sign_id == close_label_index):
-                        handle_speech_gesture(
-                            hand_sign_id,
-                            hand_sign_label,
-                            now,
-                            open_label_index,
-                            close_label_index,
-                            speech_controller,
-                            can_activate_gesture,
-                        )
+                if mode == 0 and automation_available and is_gesture_hand:
                     # OK sign -> Ctrl+T (new tab)
-                    elif (ok_label_index is not None and
+                    if (ok_label_index is not None and
                             hand_sign_id == ok_label_index):
                         if can_activate_gesture(hand_sign_label, now):
                             try:
-                                pyautogui.hotkey('ctrl', 't')
+                                automation_controller.hotkey('ctrl', 't')
                             except Exception:
                                 pass
                     # Four Fingers Up -> Ctrl+W (close tab)
@@ -1275,7 +1432,7 @@ def main_old_ui(args):
                           hand_sign_id == four_fingers_up_label_index):
                         if can_activate_gesture(hand_sign_label, now):
                             try:
-                                pyautogui.hotkey('ctrl', 'w')
+                                automation_controller.hotkey('ctrl', 'w')
                             except Exception:
                                 pass
                 
@@ -1284,7 +1441,6 @@ def main_old_ui(args):
                 # - Per-gesture cooldown to avoid repeated triggers
                 # - Requires volume control to be available
                 if mode == 0 and volume_interface is not None and is_gesture_hand:
-                    now = time.time()
                     # Thumbs Up -> Increase volume
                     if (thumbs_up_label_index is not None and
                             hand_sign_id == thumbs_up_label_index):
@@ -1310,18 +1466,17 @@ def main_old_ui(args):
                 
                 # Two Fingers Up -> Play/Pause toggle
                 # Three Fingers Up -> Go back (Alt+Left) (gesture hand only)
-                if mode == 0 and pyautogui is not None and is_gesture_hand:
-                    now = time.time()
+                if mode == 0 and automation_available and is_gesture_hand:
                     if two_fingers_up_label_index is not None and hand_sign_id == two_fingers_up_label_index:
                         if can_activate_gesture(hand_sign_label, now):
                             try:
-                                pyautogui.press('playpause')
+                                automation_controller.press('playpause')
                             except Exception:
                                 pass
                     elif three_fingers_up_label_index is not None and hand_sign_id == three_fingers_up_label_index:
                         if can_activate_gesture(hand_sign_label, now):
                             try:
-                                pyautogui.hotkey('alt', 'left')
+                                automation_controller.hotkey('alt', 'left')
                             except Exception:
                                 pass
 
@@ -1334,8 +1489,7 @@ def main_old_ui(args):
 
                 # Calculates the gesture IDs in the latest detection
                 finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
+                most_common_fg_id = Counter(finger_gesture_history).most_common(1)
 
                 # Drawing part (optimized based on quality setting)
                 if use_brect:
@@ -1347,11 +1501,15 @@ def main_old_ui(args):
                     brect,
                     handedness,
                     keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
+                    point_history_classifier_labels[most_common_fg_id[0][0]] if most_common_fg_id else "",
                 )
         else:
             point_history.append([0, 0])
 
+        if not mouse_tracking_active_this_frame:
+            _reset_air_mouse_state(air_mouse_state, automation_controller)
+
+        update_push_to_talk(speech_push_to_talk_active, speech_controller)
         if draw_point_history_enabled:
             debug_image = draw_point_history(debug_image, point_history)
         if draw_info_enabled:
@@ -1360,18 +1518,10 @@ def main_old_ui(args):
         # Screen reflection #############################################################
         cv.imshow('Hand Gesture Recognition', debug_image)
 
-    # Cleanup: signal mouse worker to exit and wait for it
-    if mouse_queue is not None and mouse_stop_event is not None:
-        mouse_stop_event.set()
-        try:
-            mouse_queue.put_nowait(_MOUSE_SENTINEL)
-        except queue.Full:
-            pass
-        mouse_thread.join(timeout=1.5)
-
     speech_controller.stop()
+    automation_controller.stop()
 
-    cap.release()
+    detector.release()
     cv.destroyAllWindows()
 
 
@@ -1388,16 +1538,21 @@ def select_mode(key, mode):
     return number, mode
 
 
-def calc_bounding_rect(image, landmarks):
+def calc_landmark_array(image, landmarks):
     image_width, image_height = image.shape[1], image.shape[0]
-
-    # Performance: Pre-allocate array instead of appending
-    landmark_array = np.zeros((21, 2), dtype=np.int32)
+    landmark_array = np.empty((len(landmarks.landmark), 2), dtype=np.int32)
 
     for idx, landmark in enumerate(landmarks.landmark):
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        landmark_array[idx] = [landmark_x, landmark_y]
+        landmark_array[idx, 0] = landmark_x
+        landmark_array[idx, 1] = landmark_y
+
+    return landmark_array
+
+
+def calc_bounding_rect(image, landmarks):
+    landmark_array = landmarks if isinstance(landmarks, np.ndarray) else calc_landmark_array(image, landmarks)
 
     x, y, w, h = cv.boundingRect(landmark_array)
 
@@ -1405,24 +1560,13 @@ def calc_bounding_rect(image, landmarks):
 
 
 def calc_landmark_list(image, landmarks):
-    image_width, image_height = image.shape[1], image.shape[0]
-
-    landmark_point = []
-
-    # Keypoint
-    for _, landmark in enumerate(landmarks.landmark):
-        landmark_x = min(int(landmark.x * image_width), image_width - 1)
-        landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        # landmark_z = landmark.z
-
-        landmark_point.append([landmark_x, landmark_y])
-
-    return landmark_point
+    if isinstance(landmarks, np.ndarray):
+        return landmarks
+    return calc_landmark_array(image, landmarks)
 
 
 def pre_process_landmark(landmark_list):
-    # Performance: Use NumPy array instead of list operations
-    temp_landmark_list = np.array(landmark_list, dtype=np.float32)
+    temp_landmark_list = np.asarray(landmark_list, dtype=np.float32).copy()
 
     # Convert to relative coordinates
     base_x, base_y = temp_landmark_list[0, 0], temp_landmark_list[0, 1]
@@ -1437,19 +1581,18 @@ def pre_process_landmark(landmark_list):
     if max_value > 0:
         temp_landmark_list = temp_landmark_list / max_value
     else:
-        temp_landmark_list = temp_landmark_list * 0.0
+        temp_landmark_list = np.zeros_like(temp_landmark_list)
 
-    return temp_landmark_list.tolist()
+    return temp_landmark_list
 
 
 def pre_process_point_history(image, point_history):
     image_width, image_height = image.shape[1], image.shape[0]
 
-    # Performance: Use NumPy array instead of list operations
     if len(point_history) == 0:
-        return []
+        return np.empty((0,), dtype=np.float32)
     
-    temp_point_history = np.array(point_history, dtype=np.float32)
+    temp_point_history = np.asarray(point_history, dtype=np.float32).copy()
 
     # Convert to relative coordinates
     base_x, base_y = temp_point_history[0, 0], temp_point_history[0, 1]
@@ -1459,7 +1602,7 @@ def pre_process_point_history(image, point_history):
     # Convert to a one-dimensional list
     temp_point_history = temp_point_history.flatten()
 
-    return temp_point_history.tolist()
+    return temp_point_history
 
 
 def logging_csv(number, mode, landmark_list, point_history_list):

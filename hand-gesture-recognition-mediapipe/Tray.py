@@ -49,8 +49,7 @@ class TrayIcon:
             pystray.MenuItem(
                 lambda item: self._speech_status_label(),
                 self.toggle_speech,
-                checked=lambda item: self._speech_enabled(),
-                enabled=lambda item: self._speech_available(),
+                enabled=lambda item: False,
             ),
             pystray.MenuItem(
                 "Toggle Transcript",
@@ -84,9 +83,9 @@ class TrayIcon:
         return self.speech_controller.is_available()
 
     def _speech_status_label(self):
-        if not self._speech_available():
+        if self.speech_controller is None:
             return "Speech: Unavailable"
-        return f"Speech: {'ON' if self._speech_enabled() else 'OFF'}"
+        return self.speech_controller.get_snapshot()["status"]
 
     def _transcript_visible(self):
         if self.speech_controller is None:
