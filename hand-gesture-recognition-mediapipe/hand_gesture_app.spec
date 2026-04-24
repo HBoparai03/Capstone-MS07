@@ -4,7 +4,7 @@
 import os
 
 import mediapipe
-from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dynamic_libs
 
 block_cipher = None
 
@@ -14,9 +14,12 @@ point_history_dir = os.path.join(model_root, "point_history_classifier")
 
 mp_root = os.path.dirname(mediapipe.__file__)
 mp_binaries = collect_dynamic_libs("mediapipe")
-vosk_datas, vosk_binaries, vosk_hiddenimports = collect_all("vosk", include_py_files=True)
+faster_whisper_datas, faster_whisper_binaries, faster_whisper_hiddenimports = collect_all("faster_whisper", include_py_files=True)
+ctranslate2_datas, ctranslate2_binaries, ctranslate2_hiddenimports = collect_all("ctranslate2", include_py_files=True)
+av_datas, av_binaries, av_hiddenimports = collect_all("av", include_py_files=True)
+sounddevice_datas = collect_data_files("_sounddevice_data")
 
-vosk_model_path = "vosk-model-small-en-us"
+fast_whisper_model_path = "faster-whisper-small"
 
 datas = [
     (os.path.join(keypoint_dir, "keypoint_classifier.tflite"), keypoint_dir),
@@ -32,10 +35,10 @@ datas = [
     ("icons/threefu.png", "icons"),
     ("icons/tup.png", "icons"),
     ("icons/twofu.png", "icons"),
-] + vosk_datas
+] + faster_whisper_datas + ctranslate2_datas + av_datas + sounddevice_datas
 
-if os.path.isdir(vosk_model_path):
-    datas.append((vosk_model_path, vosk_model_path))
+if os.path.isdir(fast_whisper_model_path):
+    datas.append((fast_whisper_model_path, fast_whisper_model_path))
 
 hiddenimports = [
     "numpy",
@@ -55,9 +58,13 @@ hiddenimports = [
     "mediapipe.python._framework_bindings",
     "sounddevice",
     "_sounddevice",
-] + vosk_hiddenimports
+    "_sounddevice_data",
+    "faster_whisper",
+    "ctranslate2",
+    "av",
+] + faster_whisper_hiddenimports + ctranslate2_hiddenimports + av_hiddenimports
 
-binaries = mp_binaries + vosk_binaries
+binaries = mp_binaries + faster_whisper_binaries + ctranslate2_binaries + av_binaries
 
 a = Analysis(
     ["app.py"],

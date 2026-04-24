@@ -4,7 +4,6 @@ import csv
 import copy
 import argparse
 import itertools
-import json
 import os
 import sys
 import ctypes
@@ -82,12 +81,11 @@ except Exception as exc:
     SOUNDDEVICE_IMPORT_ERROR = exc
 
 try:
-    from vosk import Model as VoskModel, KaldiRecognizer
-    VOSK_IMPORT_ERROR = None
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_IMPORT_ERROR = None
 except Exception as exc:
-    VoskModel = None
-    KaldiRecognizer = None
-    VOSK_IMPORT_ERROR = exc
+    WhisperModel = None
+    FASTER_WHISPER_IMPORT_ERROR = exc
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
@@ -428,14 +426,20 @@ class AutomationController:
                 self._action_queue.task_done()
 
 
+FAST_WHISPER_MODEL_DIRNAME = "faster-whisper-small"
+FAST_WHISPER_REQUIRED_FILES = ("config.json", "model.bin")
+
+
 class SpeechDictationController:
     """Persistent background speech-to-text worker with push-to-talk control."""
 
-    def __init__(self, input_controller=None, sample_rate=16000, language="en"):
+    def __init__(self, input_controller=None, sample_rate=16000, chunk_seconds=2.5, block_duration=0.25, language="en"):
         self.sample_rate = sample_rate
+        self.chunk_frames = max(int(sample_rate * chunk_seconds), sample_rate)
+        self.block_frames = max(int(sample_rate * block_duration), 1)
         self.language = language
         self._input_controller = input_controller
-        self._model_path = resource_path("vosk-model-small-en-us")
+        self._model_path = resource_path(FAST_WHISPER_MODEL_DIRNAME)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -451,7 +455,7 @@ class SpeechDictationController:
         self._input_device_name = "Unavailable"
         self._available = (
             sd is not None and
-            VoskModel is not None and
+            WhisperModel is not None and
             input_controller is not None and
             input_controller.can_type_text()
         )
@@ -462,10 +466,10 @@ class SpeechDictationController:
                 if SOUNDDEVICE_IMPORT_ERROR is not None:
                     message = f"{message}: {SOUNDDEVICE_IMPORT_ERROR}"
                 missing_parts.append(message)
-            if VoskModel is None:
-                message = "vosk import failed"
-                if VOSK_IMPORT_ERROR is not None:
-                    message = f"{message}: {VOSK_IMPORT_ERROR}"
+            if WhisperModel is None:
+                message = "faster-whisper import failed"
+                if FASTER_WHISPER_IMPORT_ERROR is not None:
+                    message = f"{message}: {FASTER_WHISPER_IMPORT_ERROR}"
                 missing_parts.append(message)
             if input_controller is None or not input_controller.can_type_text():
                 message = "input automation unavailable"
@@ -476,6 +480,9 @@ class SpeechDictationController:
         elif not os.path.isdir(self._model_path):
             self._available = False
             self._last_error = f"Speech model not found at {self._model_path}"
+        elif not self._is_model_ready():
+            self._available = False
+            self._last_error = f"Speech model is incomplete at {self._model_path}"
         else:
             self._input_device_index, self._input_device_name = self._resolve_input_device()
             if self._input_device_index is None:
@@ -515,11 +522,6 @@ class SpeechDictationController:
             self._speech_enabled = enabled
             if enabled:
                 self._last_typed_text = ""
-        if not enabled and sd is not None:
-            try:
-                sd.stop()
-            except Exception:
-                pass
         self._wake_event.set()
         return changed
 
@@ -597,14 +599,33 @@ class SpeechDictationController:
             self._set_runtime_error(exc)
         return None, "Unavailable"
 
+    def _is_model_ready(self):
+        return os.path.isdir(self._model_path) and all(
+            os.path.isfile(os.path.join(self._model_path, filename))
+            for filename in FAST_WHISPER_REQUIRED_FILES
+        )
+
     def _load_model(self):
         with self._lock:
             if self._model is not None:
                 return self._model
             self._model_loading = True
             self._last_error = ""
+        load_error = None
+        model = None
         try:
-            model = VoskModel(self._model_path)
+            for compute_type in ("int8", "float32"):
+                try:
+                    model = WhisperModel(
+                        self._model_path,
+                        device="cpu",
+                        compute_type=compute_type,
+                    )
+                    break
+                except Exception as exc:
+                    load_error = exc
+            if model is None and load_error is not None:
+                raise load_error
         except Exception as exc:
             with self._lock:
                 self._available = False
@@ -618,7 +639,53 @@ class SpeechDictationController:
             self._model_loading = False
         return model
 
+    def _transcribe_audio_buffer(self, model, audio_chunks, silence_threshold):
+        if not audio_chunks:
+            return
+
+        audio = np.concatenate(audio_chunks, axis=0)
+        audio = np.squeeze(audio).astype(np.float32, copy=False)
+        if audio.size == 0:
+            return
+
+        if float(np.max(np.abs(audio))) < silence_threshold:
+            return
+
+        try:
+            segments, _ = model.transcribe(
+                audio,
+                language=self.language,
+                beam_size=5,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+        except Exception as exc:
+            self._set_runtime_error(exc)
+            return
+
+        normalized = " ".join(text.split())
+        if not normalized:
+            return
+
+        with self._lock:
+            self._last_transcript = normalized
+            self._last_error = ""
+            already_typed = normalized == self._last_typed_text
+
+        if already_typed:
+            return
+
+        if not self._input_controller.write_text(normalized + " "):
+            self._set_runtime_error(RuntimeError("Unable to queue dictated text"))
+            return
+
+        with self._lock:
+            self._last_typed_text = normalized
+
     def _speech_worker(self):
+        silence_threshold = 0.01
+
         while not self._stop_event.is_set():
             with self._lock:
                 available = self._available
@@ -642,41 +709,43 @@ class SpeechDictationController:
                 self._wake_event.clear()
                 continue
 
+            audio_chunks = []
+            buffered_frames = 0
             try:
-                rec = KaldiRecognizer(model, self.sample_rate)
-                with sd.RawInputStream(
+                with sd.InputStream(
                     samplerate=self.sample_rate,
-                    blocksize=4000,
-                    dtype="int16",
+                    blocksize=self.block_frames,
+                    dtype="float32",
                     channels=1,
                     device=self._input_device_index,
                 ) as stream:
                     while not self._stop_event.is_set():
+                        data, _ = stream.read(self.block_frames)
                         with self._lock:
                             enabled = self._speech_enabled
+                        if data is not None and len(data):
+                            audio_chunks.append(np.array(data, copy=True))
+                            buffered_frames += len(data)
+                        if buffered_frames >= self.chunk_frames:
+                            self._transcribe_audio_buffer(model, audio_chunks, silence_threshold)
+                            audio_chunks = []
+                            buffered_frames = 0
                         if not enabled:
                             break
-                        data, _ = stream.read(4000)
-                        if rec.AcceptWaveform(bytes(data)):
-                            result = json.loads(rec.Result())
-                            text = result.get("text", "").strip()
-                            if not text:
-                                continue
-                            normalized = " ".join(text.split())
-                            with self._lock:
-                                self._last_transcript = normalized
-                                already_typed = normalized == self._last_typed_text
-                            if already_typed:
-                                continue
-                            if not self._input_controller.write_text(normalized + " "):
-                                self._set_runtime_error(RuntimeError("Unable to queue dictated text"))
-                                continue
-                            with self._lock:
-                                self._last_typed_text = normalized
             except Exception as exc:
+                if self._stop_event.is_set():
+                    break
+                with self._lock:
+                    enabled = self._speech_enabled
+                if not enabled:
+                    continue
                 self._set_runtime_error(exc)
                 self._wake_event.wait(0.25)
                 self._wake_event.clear()
+                continue
+
+            if audio_chunks and not self._stop_event.is_set():
+                self._transcribe_audio_buffer(model, audio_chunks, silence_threshold)
 
 
 def update_push_to_talk(close_hand_detected, speech_controller):

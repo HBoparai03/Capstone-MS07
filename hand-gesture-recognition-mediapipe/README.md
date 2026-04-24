@@ -6,7 +6,7 @@ This project is a real-time hand gesture recognition app built around:
 - TensorFlow Lite classifiers for static hand signs and point-history motion
 - OpenCV and PyQt5 for display
 - pyautogui and pycaw for desktop control
-- Vosk and sounddevice for optional offline speech dictation
+- faster-whisper and sounddevice for optional offline speech dictation
 
 The app is launched with:
 
@@ -25,7 +25,7 @@ The default experience is the PyQt5 overlay UI (`--ui new`).
   - `new`: transparent PyQt5 overlay with system tray controls
   - `old`: classic OpenCV window
 - Desktop control gestures for tabs, media, volume, mouse movement, and click
-- Push-to-talk speech dictation using an offline Vosk model
+- Push-to-talk speech dictation using an offline faster-whisper model
 - Runtime gesture-hand switching and mouse enable/disable from the tray menu
 - Latest-frame camera capture to reduce latency under load
 
@@ -136,7 +136,8 @@ pip install -r requirements.txt
 - `mediapipe`
 - `opencv-python`
 - `PyAutoGUI`
-- `vosk`
+- `faster-whisper`
+- `huggingface-hub`
 - `sounddevice`
 
 ### 3. Install the UI and Windows control packages used by the default app experience
@@ -164,13 +165,13 @@ pip install scikit-learn jupyter ipykernel pandas seaborn matplotlib
 
 Speech dictation is optional. The app will still run if the speech model is missing.
 
-To install the offline Vosk model:
+To install the offline faster-whisper model:
 
 ```bash
-python download_vosk_model.py
+python download_whisper_model.py
 ```
 
-This downloads `vosk-model-small-en-us/` next to `app.py`.
+This downloads `faster-whisper-small/` next to `app.py`.
 
 If the model is missing, the app still launches, but speech shows as unavailable in the UI.
 
@@ -255,7 +256,7 @@ hand-gesture-recognition-mediapipe/
 |-- Capture.py
 |-- Overlay.py
 |-- Tray.py
-|-- download_vosk_model.py
+|-- download_whisper_model.py
 |-- requirements.txt
 |-- SPEECH_SETUP.md
 |-- hand_gesture_app.spec
@@ -264,7 +265,7 @@ hand-gesture-recognition-mediapipe/
 |   `-- point_history_classifier/
 |-- icons/
 |-- utils/
-`-- vosk-model-small-en-us/   # created after running download_vosk_model.py
+`-- faster-whisper-small/     # created after running download_whisper_model.py
 ```
 
 ## Model and Notebook Files
@@ -287,10 +288,10 @@ Install PyInstaller:
 pip install pyinstaller
 ```
 
-If you want the packaged app to include speech dictation, download the Vosk model before building:
+If you want the packaged app to include speech dictation, download the faster-whisper model before building:
 
 ```bash
-python download_vosk_model.py
+python download_whisper_model.py
 ```
 
 Then build:
@@ -311,8 +312,9 @@ The current spec bundles:
 - both label CSV files
 - MediaPipe runtime assets
 - the tray/app icon and overlay PNGs
-- Vosk Python package assets
-- the Vosk model folder if it exists locally at build time
+- faster-whisper Python package assets
+- CTranslate2 and AV runtime assets required by faster-whisper
+- the faster-whisper model folder if it exists locally at build time
 
 ## Troubleshooting
 
@@ -328,8 +330,8 @@ pip install PyQt5 pystray pillow
 
 Check all of the following:
 
-- `vosk-model-small-en-us/` exists next to `app.py`
-- `vosk` is installed
+- `faster-whisper-small/` exists next to `app.py`
+- `faster-whisper` is installed
 - `sounddevice` is installed
 - a microphone is available
 - `pyautogui` is installed so dictated text can be typed back into the active window
@@ -353,5 +355,5 @@ Make sure:
 ## Notes
 
 - The app is designed to preserve the current gesture mappings and user-facing behavior
-- Speech dictation is offline once the Vosk model has been downloaded
+- Speech dictation is offline once the faster-whisper model has been downloaded
 - The default UI path is `python app.py`

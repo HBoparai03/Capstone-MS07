@@ -27,11 +27,13 @@ __pycache__/
 build/
 dist/
 
-# Vosk model (too large for git — run download_vosk_model.py to get it)
+# Speech models (too large for git - download them locally as needed)
+faster-whisper-small/
 vosk-model-small-en-us/
 
 # OS
 .DS_Store
 Thumbs.db
 
+faster-whisper-small
 vosk-model-small-en-us

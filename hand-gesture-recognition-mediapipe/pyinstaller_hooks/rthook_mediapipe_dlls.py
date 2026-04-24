@@ -17,7 +17,8 @@ def _register_dll_directories():
         os.path.join(meipass, "numpy.libs"),
         os.path.join(meipass, "scipy.libs"),
         os.path.join(meipass, "PyQt5", "Qt5", "bin"),
-        os.path.join(meipass, "vosk"),
+        os.path.join(meipass, "ctranslate2"),
+        os.path.join(meipass, "av"),
     ]
 
     handles = getattr(sys, "_dll_directory_handles", [])

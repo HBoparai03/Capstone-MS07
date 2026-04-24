@@ -4,5 +4,6 @@ tensorflow==2.15.0
 mediapipe==0.10.9
 opencv-python==4.8.1.78
 PyAutoGUI==0.9.54
-vosk
+faster-whisper
+huggingface-hub
 sounddevice
